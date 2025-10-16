@@ -9,10 +9,7 @@ from pymongo import MongoClient
 from telegram.error import BadRequest
 
 # ------------------- CONFIG -------------------
-BOT_TOKEN = "8438421612:AAGKN8yhxJhKeburpObdJH7uCBDjkKe9OcE"  # replace if needed
-MONGO_URI = "mongodb://hailolaa21:Moadsahaka%4021@ac-ssihrei-shard-00-00.n6mkod3.mongodb.net:27017,ac-ssihrei-shard-00-01.n6mkod3.mongodb.net:27017,ac-ssihrei-shard-00-02.n6mkod3.mongodb.net:27017/?ssl=true&replicaSet=atlas-qe9n3u-shard-0&authSource=admin&retryWrites=true&w=majority&appName=ElderlyCare"
-ADMIN_IDS = [949915518]  # <-- put admin Telegram ID(s) here
-ADMIN_CHANNEL_ID = -1003109673977  # <-- Now an integer, not a list
+
 
 client = MongoClient(MONGO_URI)
 db = client["unimatch_bot"]
