@@ -438,6 +438,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_or_send_callback(update.callback_query, "Choose an option:", reply_markup=reply_markup)
 
 # ------------------- MATCH SYSTEM -------------------
+# ------------------- FIND MATCH -------------------
 async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -460,12 +461,26 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return True
 
     filtered = [c for c in candidates if eligible(c)]
-    keyboard = [
-        [InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")]
-    ]
+
+    # If no profiles left to show, reset passed and likes
     if not filtered:
-        await safe_edit_or_send_callback(query, "No matches found 😢 Try again later.", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
+        users_collection.update_one(
+            {"user_id": user_id},
+            {"$set": {"passed": [], "likes": []}}
+        )
+        candidates = list(users_collection.find(search_query))
+        filtered = [c for c in candidates if c.get("user_id") != user_id]
+
+        if not filtered:
+            keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")]]
+            await safe_edit_or_send_callback(
+                query,
+                "No matches available at the moment 😢 Try again later.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+        else:
+            await query.message.reply_text("✨ You've seen everyone! Starting fresh...")
 
     candidate = random.choice(filtered)
     caption = (
@@ -474,17 +489,29 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Year: {candidate.get('year')}\n"
         f"{candidate.get('bio')}"
     )
+
     photos = candidate.get("photos", [])
     match_keyboard = [
-        [InlineKeyboardButton("❤️ Like", callback_data=f"like_{candidate.get('user_id')}"),
-         InlineKeyboardButton("💔 Skip", callback_data=f"skip_{candidate.get('user_id')}")],
+        [
+            InlineKeyboardButton("❤️ Like", callback_data=f"like_{candidate.get('user_id')}"),
+            InlineKeyboardButton("💔 Skip", callback_data=f"skip_{candidate.get('user_id')}")
+        ],
         [InlineKeyboardButton("🚫 Report", callback_data=f"report_{candidate.get('user_id')}")],
         [InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")]
     ]
+
     if photos:
-        await query.message.reply_photo(photos[-1], caption=caption, reply_markup=InlineKeyboardMarkup(match_keyboard))
+        await query.message.reply_photo(
+            photos[-1],
+            caption=caption,
+            reply_markup=InlineKeyboardMarkup(match_keyboard)
+        )
     else:
-        await safe_edit_or_send_callback(query, caption, reply_markup=InlineKeyboardMarkup(match_keyboard))
+        await safe_edit_or_send_callback(
+            query,
+            caption,
+            reply_markup=InlineKeyboardMarkup(match_keyboard)
+        )
 
 # ------------------- LIKE HANDLER -------------------
 async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -625,10 +652,10 @@ def main():
 
     # Set webhook with Telegram
     app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=WEBHOOK_PATH,  # this is usually your bot token
-        webhook_url=f"{BASE_URL}{WEBHOOK_PATH}",  # full URL Telegram will call
+    listen="0.0.0.0",
+    port=PORT,
+    url_path=BOT_TOKEN,  # Use token as the URL path
+    webhook_url=f"{BASE_URL}/{BOT_TOKEN}",  # Full URL Telegram will call
     )
 
 
