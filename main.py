@@ -627,9 +627,10 @@ def main():
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
-        webhook_url=f"{BASE_URL}{WEBHOOK_PATH}",
-        webhook_path=WEBHOOK_PATH,
+        url_path=WEBHOOK_PATH,  # this is usually your bot token
+        webhook_url=f"{BASE_URL}{WEBHOOK_PATH}",  # full URL Telegram will call
     )
+
 
 if __name__ == "__main__":
     main()
