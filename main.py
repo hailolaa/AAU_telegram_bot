@@ -157,7 +157,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("Please enter a valid department.")
             return
         users_collection.update_one({"user_id": user_id}, {"$set": {"department": text, "step": "awaiting_year"}})
-        await message.reply_text("Awesome! Now enter your year (e.g., 1st, 2nd, 3rd, 4th):")
+        await message.reply_text("Awesome! Now enter your year (e.g., 1st, 2nd, 3rd, 4th, Alumni):")
         return
 
     if step == "awaiting_year":
