@@ -1,5 +1,7 @@
 import logging
 import random
+import os
+from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
@@ -9,19 +11,12 @@ from pymongo import MongoClient
 from telegram.error import BadRequest
 
 
-import os
-try:
-    from dotenv import load_dotenv  # type: ignore
-except Exception:
-    # dotenv not available — use a no-op so env lookups still work from the environment
-    def load_dotenv():
-        return
-
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 ADMIN_IDS = [int(os.getenv("ADMIN_ID"))] if os.getenv("ADMIN_ID") else []
+ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID")) if os.getenv("ADMIN_CHANNEL_ID") else None  # <-- Add this line
 
 
 
