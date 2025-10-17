@@ -1,4 +1,4 @@
-python-telegram-bot==20.3
-pymongo
-dnspython
+python-telegram-bot[webhooks]
+aiohttp
 python-dotenv
+pymongo

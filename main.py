@@ -9,6 +9,7 @@ from telegram.ext import (
 )
 from pymongo import MongoClient
 from telegram.error import BadRequest
+from aiohttp import web
 
 
 load_dotenv()
@@ -17,7 +18,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 ADMIN_IDS = [int(os.getenv("ADMIN_ID"))] if os.getenv("ADMIN_ID") else []
 ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID")) if os.getenv("ADMIN_CHANNEL_ID") else None  # <-- Add this line
-
+WEBHOOK_PATH = "/webhook"
+PORT = int(os.getenv("PORT", 10000))
+BASE_URL = os.getenv("BASE_URL")  # e.g. https://your-app-name.onrender.com
 
 
 client = MongoClient(MONGO_URI)
@@ -619,7 +622,14 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_like, pattern=r"^like_"))
     app.add_handler(CallbackQueryHandler(handle_buttons))
     app.add_handler(CommandHandler("admin", admin_command))
-    app.run_polling()
+
+    # Set webhook with Telegram
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        webhook_url=f"{BASE_URL}{WEBHOOK_PATH}",
+        webhook_path=WEBHOOK_PATH,
+    )
 
 if __name__ == "__main__":
     main()
