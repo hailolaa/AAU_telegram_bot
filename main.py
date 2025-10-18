@@ -727,6 +727,9 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_like, pattern=r"^like_"))
     app.add_handler(CallbackQueryHandler(handle_buttons))
     app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CallbackQueryHandler(show_liker_profile, pattern=r"^show_liker_"))
+    app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer("Skipped ❤️"), pattern="ignore_like"))
+
 
     # Set webhook with Telegram
     app.run_webhook(
