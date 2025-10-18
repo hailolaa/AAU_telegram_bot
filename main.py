@@ -595,7 +595,7 @@ async def show_liker_profile(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("Invalid user.")
         return
 
-    liker = ensure_user_doc(users_collection.find_one({"user_id": liker_id}))
+    liker = users_collection.find_one({"user_id": liker_id})
     if not liker:
         await query.answer("User not found.")
         return
