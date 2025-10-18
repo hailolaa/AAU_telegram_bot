@@ -720,15 +720,24 @@ async def handle_help_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ------------------- APP SETUP -------------------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
+
+    # --- Command Handlers ---
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("admin", admin_command))
+
+    # --- Message Handlers ---
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+
+    # --- Callback Query Handlers (specific ones first) ---
     app.add_handler(CallbackQueryHandler(handle_like, pattern=r"^like_"))
-    app.add_handler(CallbackQueryHandler(handle_buttons))
-    app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CallbackQueryHandler(show_liker_profile, pattern=r"^show_liker_"))
     app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer("Skipped ❤️"), pattern="ignore_like"))
+
+    # --- Keep this last! (generic handler) ---
+    app.add_handler(CallbackQueryHandler(handle_buttons))
+
 
 
     # Set webhook with Telegram
