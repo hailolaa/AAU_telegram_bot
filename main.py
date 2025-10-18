@@ -425,7 +425,6 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("💖 Find Match", callback_data="find_match")],
         [InlineKeyboardButton("👤 View Profile", callback_data="view_profile")],
         [InlineKeyboardButton("✏️ Edit Profile", callback_data="edit_profile")],
-        [InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard")],
         [InlineKeyboardButton("❓ Help", callback_data="help_command")],  # Added help button
     ]
     if update.effective_user.id in ADMIN_IDS:
