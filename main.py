@@ -522,6 +522,7 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query.data or "_" not in query.data:
         await query.answer("Invalid action")
         return
+
     try:
         liked_id = int(query.data.split("_", 1)[1])
     except Exception:
@@ -535,6 +536,7 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("User not found.")
         return
 
+    # Update like lists
     users_collection.update_one({"user_id": user_id}, {"$addToSet": {"likes": liked_id}})
     users_collection.update_one({"user_id": liked_id}, {"$addToSet": {"liked_by": user_id}})
 
@@ -542,47 +544,20 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
     liked_name = liked_doc.get("name", "Someone")
     await query.answer(f"You liked {liked_name} ❤️")
 
-    # 🔔 Send liker’s full profile to the liked person
+    # 💬 Step 1: Send "someone liked you" message with 'Show' and 'Skip' buttons
     try:
-        photos = liker.get("photos", [])
-        caption = (
-            f"💘 *Someone liked you!* 💘\n\n"
-            f"{liker.get('name', 'Unknown')}, {liker.get('age', 'N/A')}\n"
-            f"Department: {liker.get('department', 'N/A')}\n"
-            f"Year: {liker.get('year', 'N/A')}\n"
-            f"{liker.get('bio', 'No bio available')}"
-        )
-
-        match_keyboard = InlineKeyboardMarkup([
+        keyboard = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("❤️ Like", callback_data=f"like_{liker['user_id']}"),
-                InlineKeyboardButton("💔 Skip", callback_data=f"skip_{liker['user_id']}")
-            ],
-            [
-                InlineKeyboardButton("🚫 Report", callback_data=f"report_{liker['user_id']}")
-            ],
-            [
-                InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")
+                InlineKeyboardButton("👀 Show Profile", callback_data=f"show_liker_{user_id}"),
+                InlineKeyboardButton("❌ Skip", callback_data="ignore_like")
             ]
         ])
-
-        # Send photo if exists, otherwise send text
-        if photos:
-            await context.bot.send_photo(
-                chat_id=liked_id,
-                photo=photos[-1],
-                caption=caption,
-                reply_markup=match_keyboard,
-                parse_mode="Markdown"
-            )
-        else:
-            await context.bot.send_message(
-                chat_id=liked_id,
-                text=caption,
-                reply_markup=match_keyboard,
-                parse_mode="Markdown"
-            )
-
+        await context.bot.send_message(
+            chat_id=liked_id,
+            text="💌 *Someone just liked you!* ❤️\nDo you want to see who it is?",
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
     except Exception as e:
         print(f"❌ Failed to send like notification: {e}")
 
@@ -605,8 +580,61 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-    # Move to next profile for liker
     await find_match(update, context)
+
+
+
+async def show_liker_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    try:
+        liker_id = int(data.split("_", 2)[2])
+    except Exception:
+        await query.answer("Invalid user.")
+        return
+
+    liker = ensure_user_doc(users_collection.find_one({"user_id": liker_id}))
+    if not liker:
+        await query.answer("User not found.")
+        return
+
+    photos = liker.get("photos", [])
+    caption = (
+        f"{liker.get('name', 'Unknown')}, {liker.get('age', 'N/A')}\n"
+        f"Department: {liker.get('department', 'N/A')}\n"
+        f"Year: {liker.get('year', 'N/A')}\n"
+        f"{liker.get('bio', 'No bio available')}"
+    )
+
+    match_keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("❤️ Like", callback_data=f"like_{liker_id}"),
+            InlineKeyboardButton("💔 Skip", callback_data=f"skip_{liker_id}")
+        ],
+        [
+            InlineKeyboardButton("🚫 Report", callback_data=f"report_{liker_id}")
+        ],
+        [
+            InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")
+        ]
+    ])
+
+    if photos:
+        await query.message.reply_photo(
+            photo=photos[-1],
+            caption=caption,
+            parse_mode="Markdown",
+            reply_markup=match_keyboard
+        )
+    else:
+        await query.message.reply_text(
+            caption,
+            parse_mode="Markdown",
+            reply_markup=match_keyboard
+        )
+
 
 
 
