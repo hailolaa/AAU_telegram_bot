@@ -542,41 +542,49 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
     liked_name = liked_doc.get("name", "Someone")
     await query.answer(f"You liked {liked_name} ❤️")
 
-    # 🔔 Send liker profile to the liked person
+    # 🔔 Send liker’s full profile to the liked person
     try:
-        keyboard = InlineKeyboardMarkup([
+        photos = liker.get("photos", [])
+        caption = (
+            f"💘 *Someone liked you!* 💘\n\n"
+            f"{liker.get('name', 'Unknown')}, {liker.get('age', 'N/A')}\n"
+            f"Department: {liker.get('department', 'N/A')}\n"
+            f"Year: {liker.get('year', 'N/A')}\n"
+            f"{liker.get('bio', 'No bio available')}"
+        )
+
+        match_keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("❤️ Like", callback_data=f"like_{liker['user_id']}"),
-                InlineKeyboardButton("⏭️ Skip", callback_data="skip")
+                InlineKeyboardButton("💔 Skip", callback_data=f"skip_{liker['user_id']}")
             ],
             [
                 InlineKeyboardButton("🚫 Report", callback_data=f"report_{liker['user_id']}")
+            ],
+            [
+                InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")
             ]
         ])
 
-        caption = (
-            f"💘 *Someone liked you!* 💘\n\n"
-            f"📸 *{liker.get('name', 'Unknown')}*, {liker.get('age', 'N/A')}\n"
-            f"💬 {liker.get('bio', 'No bio available')}"
-        )
-
-        if 'photo_id' in liker and liker['photo_id']:
+        # Send photo if exists, otherwise send text
+        if photos:
             await context.bot.send_photo(
                 chat_id=liked_id,
-                photo=liker['photo_id'],
+                photo=photos[-1],
                 caption=caption,
-                reply_markup=keyboard,
+                reply_markup=match_keyboard,
                 parse_mode="Markdown"
             )
         else:
             await context.bot.send_message(
                 chat_id=liked_id,
                 text=caption,
-                reply_markup=keyboard,
+                reply_markup=match_keyboard,
                 parse_mode="Markdown"
             )
+
     except Exception as e:
-        print(f"Failed to send like notification: {e}")
+        print(f"❌ Failed to send like notification: {e}")
 
     # 💞 If mutual like — notify both
     if user_id in liked_doc.get("likes", []):
@@ -584,19 +592,22 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
         liker_name = liker_doc.get("name", "Someone")
         liked_tg = liked_doc.get("tg_username")
         liker_tg = liker_doc.get("tg_username")
+
         try:
             mention_for_liker = f"@{liked_tg}" if liked_tg else liked_name
             mention_for_liked = f"@{liker_tg}" if liker_tg else liker_name
             await context.bot.send_message(user_id, f"💞 It's a match! You and {liked_name} liked each other!\nContact: {mention_for_liker}")
         except Exception:
             pass
+
         try:
             await context.bot.send_message(liked_id, f"💞 It's a match! You and {liker_name} liked each other!\nContact: {mention_for_liked}")
         except Exception:
             pass
 
-    # Move to next profile
+    # Move to next profile for liker
     await find_match(update, context)
+
 
 
 # ------------------- LEADERBOARD -------------------
