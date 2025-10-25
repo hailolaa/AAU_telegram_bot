@@ -74,7 +74,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     tg_username = update.effective_user.username
     user = users_collection.find_one({"user_id": user_id})
-     privacy_note = (
+    privacy_note = (
         "🔒 StudentConnect respects privacy. Profiles are shared inside the bot only. "
         "If you get a match, you can choose what contact info to exchange."
     )
