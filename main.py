@@ -74,13 +74,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     tg_username = update.effective_user.username
     user = users_collection.find_one({"user_id": user_id})
+     privacy_note = (
+        "🔒 StudentConnect respects privacy. Profiles are shared inside the bot only. "
+        "If you get a match, you can choose what contact info to exchange."
+    )
     if user:
         users_collection.update_one({"user_id": user_id}, {"$set": {"tg_username": tg_username}})
         keyboard = [[InlineKeyboardButton("🌟 Main Menu", callback_data="main_menu")]]
         if update.message:
-            await update.message.reply_text("Welcome back ❤️ Use the menu below.", reply_markup=InlineKeyboardMarkup(keyboard))
+            await update.message.reply_text("Welcome back! {privacy_note}, Use the menu below.", reply_markup=InlineKeyboardMarkup(keyboard))
         else:
-            await safe_edit_or_send_message(update, "Welcome back ❤️ Use the menu below.", reply_markup=InlineKeyboardMarkup(keyboard))
+            await safe_edit_or_send_message(update, "Welcome back! {privacy_note}, Use the menu below.", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     users_collection.insert_one({
@@ -95,7 +99,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "year": ""
     })
     await update.message.reply_text(
-        "Hey 👋 Welcome to UniMatch!\nPress the button to start onboarding:",
+        "Hey 👋 Welcome to AAU-LinkUp\nPress the button to start onboarding:",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Start", callback_data="start_onboarding")]])
     )
 
@@ -422,8 +426,8 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ------------------- MAIN MENU -------------------
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("💖 Find Match", callback_data="find_match")],
-        [InlineKeyboardButton("👤 View Profile", callback_data="view_profile")],
+        [InlineKeyboardButton("View Profiles", callback_data="find_match")],
+        [InlineKeyboardButton("👤 My Profile", callback_data="view_profile")],
         [InlineKeyboardButton("✏️ Edit Profile", callback_data="edit_profile")],
         [InlineKeyboardButton("❓ Help", callback_data="help_command")],  # Added help button
     ]
@@ -492,8 +496,8 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photos = candidate.get("photos", [])
     match_keyboard = [
         [
-            InlineKeyboardButton("❤️ Like", callback_data=f"like_{candidate.get('user_id')}"),
-            InlineKeyboardButton("💔 Skip", callback_data=f"skip_{candidate.get('user_id')}")
+            InlineKeyboardButton("👍 Connect", callback_data=f"like_{candidate.get('user_id')}"),
+            InlineKeyboardButton("⏭ Skip", callback_data=f"skip_{candidate.get('user_id')}")
         ],
         [InlineKeyboardButton("🚫 Report", callback_data=f"report_{candidate.get('user_id')}")],
         [InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")]
@@ -553,7 +557,7 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         await context.bot.send_message(
             chat_id=liked_id,
-            text="💌 *Someone just liked you!* ❤️\nDo you want to see who it is?",
+            text="💌 Someone on StudentConnect is interested in connecting with you. Would you like to see their profile?",
             parse_mode="Markdown",
             reply_markup=keyboard
         )
@@ -570,12 +574,12 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             mention_for_liker = f"@{liked_tg}" if liked_tg else liked_name
             mention_for_liked = f"@{liker_tg}" if liker_tg else liker_name
-            await context.bot.send_message(user_id, f"💞 It's a match! You and {liked_name} liked each other!\nContact: {mention_for_liker}")
+            await context.bot.send_message(user_id, f"💞 It's a mutual connection! You and {liked_name} expressed interest. Feel free to chat and exchange details. : {mention_for_liker}")
         except Exception:
             pass
-
+ 
         try:
-            await context.bot.send_message(liked_id, f"💞 It's a match! You and {liker_name} liked each other!\nContact: {mention_for_liked}")
+            await context.bot.send_message(liked_id, f"💞 It's a mutual connection! You and {liked_name} expressed interest. Feel free to chat and exchange details. : {mention_for_liker}")
         except Exception:
             pass
 
@@ -609,8 +613,8 @@ async def show_liker_profile(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     match_keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("❤️ Like", callback_data=f"like_{liker_id}"),
-            InlineKeyboardButton("💔 Skip", callback_data=f"skip_{liker_id}")
+            InlineKeyboardButton("👍 Connect", callback_data=f"like_{liker_id}"),
+            InlineKeyboardButton("⏭ Skip", callback_data=f"skip_{liker_id}")
         ],
         [
             InlineKeyboardButton("🚫 Report", callback_data=f"report_{liker_id}")
