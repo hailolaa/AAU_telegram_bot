@@ -741,7 +741,9 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users_collection.update_one({"user_id": liked_id}, {"$addToSet": {"liked_by": user_id}})
 
     # Check for mutual like: whether the liked user already has the liker in their "likes"
+    # (we check DB for the liked user's likes array)
     mutual = users_collection.find_one({"user_id": liked_id, "likes": user_id}) is not None
+    logger.info("handle_like: user=%s liked=%s mutual=%s", user_id, liked_id, mutual)
 
     # Refresh liked_doc for display name
     liked_doc = users_collection.find_one({"user_id": liked_id})
@@ -781,8 +783,19 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception:
                 logger.exception("Couldn't notify liked about mutual match (liked_id=%s, user_id=%s).", liked_id, user_id)
+
+            # Also update the current inline message to reflect the mutual match (so user sees immediate feedback
+            # and the bot does not silently proceed to the next match)
+            try:
+                await safe_edit_or_send_callback(query, f"💞 It's a mutual connection with {liked_display}! Check your messages.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")]]))
+            except Exception:
+                # best effort; ignore failures here
+                logger.debug("Couldn't edit callback message to show mutual confirmation.")
         except Exception:
             logger.exception("Failed to send mutual connection notifications for %s <-> %s", user_id, liked_id)
+
+        # Important: do NOT immediately call find_match here — user should see the match confirmation.
+        return
     else:
         # Notify the liked user that someone is interested and offer to show their profile
         try:
@@ -800,7 +813,7 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             logger.exception("Failed to send like notification to %s from %s.", liked_id, user_id)
 
-    # Continue showing matches
+    # Continue showing matches (only in non-mutual scenario)
     await find_match(update, context)
 
 
