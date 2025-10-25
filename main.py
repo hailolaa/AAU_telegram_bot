@@ -24,7 +24,7 @@ BASE_URL = os.getenv("BASE_URL")  # e.g. https://your-app-name.onrender.com
 
 
 client = MongoClient(MONGO_URI)
-db = client["unimatch_bot"]
+db = client["unimatch_bot2"]
 users_collection = db["users"]
 
 logging.basicConfig(level=logging.INFO)
