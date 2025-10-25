@@ -2,6 +2,7 @@ import logging
 import random
 import os
 import sys
+from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -10,6 +11,7 @@ from telegram.ext import (
 )
 from pymongo import MongoClient
 from telegram.error import BadRequest
+from bson.objectid import ObjectId
 from aiohttp import web
 
 
@@ -31,6 +33,7 @@ if not BOT_TOKEN:
 client = MongoClient(MONGO_URI) if MONGO_URI else MongoClient()
 db = client["unimatch_bot2"]
 users_collection = db["users"]
+reports_collection = db["reports"]  # new collection to persist reports
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -236,7 +239,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if step == "edit_year":
         if not text:
-            await message.reply_text("Please enter a valid year.")
+            await message.reply_text("Please send a valid year.")
             return
         users_collection.update_one({"user_id": user_id}, {"$set": {"year": text, "step": "done"}})
         await message.reply_text("✅ Year updated.")
@@ -398,9 +401,158 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("report_"):
-        target_id = int(data.split("_", 1)[1])
-        # You can log this or notify admin
-        await safe_edit_or_send_callback(query, "🚫 User reported. Thank you for keeping AAU-LinkUp safe!")
+        # Enhanced report handling:
+        try:
+            target_id = int(data.split("_", 1)[1])
+        except Exception:
+            await safe_edit_or_send_callback(query, "Invalid report target.")
+            return
+
+        reporter_id = query.from_user.id
+
+        # Prevent reporter from reporting themselves
+        if reporter_id == target_id:
+            await safe_edit_or_send_callback(query, "You cannot report yourself.")
+            return
+
+        # Prevent duplicate reports by same reporter for the same target (only if open)
+        existing = reports_collection.find_one({
+            "target_id": target_id,
+            "reporter_id": reporter_id,
+            "status": {"$in": ["open", "pending"]}
+        })
+        if existing:
+            await safe_edit_or_send_callback(query, "You've already reported this user. Our admins will review it.")
+            return
+
+        # Persist the report
+        report_doc = {
+            "target_id": target_id,
+            "reporter_id": reporter_id,
+            "created_at": datetime.utcnow(),
+            "status": "open"
+        }
+        try:
+            res = reports_collection.insert_one(report_doc)
+            report_id = str(res.inserted_id)
+        except Exception:
+            logger.exception("Failed to save report to DB for target=%s by reporter=%s", target_id, reporter_id)
+            await safe_edit_or_send_callback(query, "❌ Failed to file the report. Please try again later.")
+            return
+
+        # Acknowledge the reporter
+        await safe_edit_or_send_callback(query, "🚫 Thank you — we've recorded your report. Our admins will review it shortly.")
+
+        # Notify admin channel (or each admin privately if no channel configured)
+        try:
+            target_user = users_collection.find_one({"user_id": target_id}) or {}
+            reporter_user = users_collection.find_one({"user_id": reporter_id}) or {}
+
+            admin_text = (
+                f"⚠️ New report (id: {report_id})\n\n"
+                f"Target: {target_user.get('name','Unknown')} (id: {target_id})\n"
+                f"Reported by: {reporter_user.get('name','Unknown')} (id: {reporter_id})\n"
+                f"Time: {datetime.utcnow().isoformat()} UTC\n\n"
+                f"Use the buttons to view profile / ban or ignore the report."
+            )
+
+            admin_keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("View Profile", callback_data=f"admin_view_{target_id}"),
+                    InlineKeyboardButton("Ban User", callback_data=f"admin_ban_{target_id}")
+                ],
+                [
+                    InlineKeyboardButton("Ignore Report", callback_data=f"admin_ignore_{report_id}")
+                ]
+            ])
+
+            if ADMIN_CHANNEL_ID:
+                await context.bot.send_message(chat_id=ADMIN_CHANNEL_ID, text=admin_text, reply_markup=admin_keyboard)
+            else:
+                # fallback: DM each admin
+                for aid in ADMIN_IDS:
+                    try:
+                        await context.bot.send_message(chat_id=aid, text=admin_text, reply_markup=admin_keyboard)
+                    except Exception:
+                        logger.exception("Failed to DM admin %s about report %s", aid, report_id)
+        except Exception:
+            logger.exception("Failed to notify admins about report %s", report_id)
+
+        return
+
+    if data.startswith("admin_view_"):
+        # Only admins may use admin actions
+        if query.from_user.id not in ADMIN_IDS:
+            await safe_edit_or_send_callback(query, "⛔ Only admins can use this.")
+            return
+        try:
+            target_id = int(data.split("_", 2)[2])
+        except Exception:
+            await safe_edit_or_send_callback(query, "Invalid target.")
+            return
+
+        target = users_collection.find_one({"user_id": target_id})
+        if not target:
+            await safe_edit_or_send_callback(query, "User not found.")
+            return
+
+        photos = target.get("photos", [])
+        caption = (
+            f"{target.get('name','Unknown')}, {target.get('age','N/A')}\n"
+            f"Dept: {target.get('department','N/A')} | Year: {target.get('year','N/A')}\n"
+            f"{target.get('bio','No bio available')}\n"
+            f"ID: {target_id}\n"
+            f"Reported by: see reports collection"
+        )
+
+        admin_actions = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Ban User", callback_data=f"admin_ban_{target_id}"),
+                InlineKeyboardButton("Back to Admin Panel", callback_data="admin_panel")
+            ]
+        ])
+        try:
+            if photos:
+                await query.message.reply_photo(photo=photos[-1], caption=caption, reply_markup=admin_actions)
+            else:
+                await query.message.reply_text(caption, reply_markup=admin_actions)
+        except Exception:
+            logger.exception("Failed to send admin view profile for %s", target_id)
+        return
+
+    if data.startswith("admin_ban_"):
+        if query.from_user.id not in ADMIN_IDS:
+            await safe_edit_or_send_callback(query, "⛔ Only admins can perform this action.")
+            return
+        try:
+            target_id = int(data.split("_", 2)[2])
+        except Exception:
+            await safe_edit_or_send_callback(query, "Invalid target.")
+            return
+        users_collection.update_one({"user_id": target_id}, {"$set": {"banned": True}})
+        await safe_edit_or_send_callback(query, f"User {target_id} has been banned.")
+        try:
+            await context.bot.send_message(target_id, "You have been banned from AAU-LinkUp by the admins.")
+        except Exception:
+            logger.debug("Couldn't DM user about ban (they may not have started the bot).")
+        return
+
+    if data.startswith("admin_ignore_"):
+        if query.from_user.id not in ADMIN_IDS:
+            await safe_edit_or_send_callback(query, "⛔ Only admins can perform this action.")
+            return
+        try:
+            report_id = data.split("_", 2)[2]
+            oid = ObjectId(report_id)
+        except Exception:
+            await safe_edit_or_send_callback(query, "Invalid report id.")
+            return
+        try:
+            reports_collection.update_one({"_id": oid}, {"$set": {"status": "ignored", "reviewed_by": query.from_user.id, "reviewed_at": datetime.utcnow()}})
+            await safe_edit_or_send_callback(query, f"Report {report_id} marked as ignored.")
+        except Exception:
+            logger.exception("Failed to mark report %s as ignored", report_id)
+            await safe_edit_or_send_callback(query, "Failed to mark report as ignored.")
         return
 
     if data == "help_command":
@@ -474,7 +626,7 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     user = ensure_user_doc(users_collection.find_one({"user_id": user_id}))
 
-    search_query = {"user_id": {"$ne": user_id}, "step": "done"}
+    search_query = {"user_id": {"$ne": user_id}, "step": "done", "banned": {"$ne": True}}
     interested_in = user.get("interested_in")
     if interested_in and interested_in != "both":
         search_query["gender"] = interested_in
@@ -486,6 +638,9 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
     def eligible(c):
         uid = c.get("user_id")
         if uid == user_id or uid in (user.get("likes") or []) or uid in (user.get("passed") or []):
+            return False
+        # Also skip banned users (defense-in-depth)
+        if c.get("banned"):
             return False
         return True
 
@@ -574,7 +729,14 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("User not found.")
         return
 
-    # Update like lists
+    # Prevent duplicate likes from the same user (explicit check)
+    if liked_id in (liker.get("likes") or []):
+        await query.answer("You've already connected with this user.")
+        # Continue showing matches without re-notifying
+        await find_match(update, context)
+        return
+
+    # Update like lists (use addToSet as safety)
     users_collection.update_one({"user_id": user_id}, {"$addToSet": {"likes": liked_id}})
     users_collection.update_one({"user_id": liked_id}, {"$addToSet": {"liked_by": user_id}})
 
@@ -586,31 +748,43 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
     liked_name = liked_doc.get("name", "Someone")
     await query.answer(f"You liked {liked_name} ❤️")
 
-    if mutual:
-        # Notify both users about the mutual connection
-        try:
-            liker_doc = users_collection.find_one({"user_id": user_id})
-            liked_tg = liked_doc.get("tg_username")
-            liker_tg = liker_doc.get("tg_username")
+    # Prepare documents used for mention / messaging
+    try:
+        liker_doc = users_collection.find_one({"user_id": user_id})
+        liked_tg = liked_doc.get("tg_username")
+        liker_tg = liker_doc.get("tg_username")
+    except Exception:
+        liked_tg = None
+        liker_tg = None
 
-            mention_for_liker = f"@{liked_tg}" if liked_tg else liked_doc.get("name", "Someone")
-            mention_for_liked = f"@{liker_tg}" if liker_tg else liker_doc.get("name", "Someone")
+    if mutual:
+        # Mutual connection: notify both users and include username/mention for the liker
+        try:
+            # Use username if available, otherwise fall back to display name.
+            liker_display = f"@{liker_tg}" if liker_tg else (liker_doc.get("name") or "Someone")
+            liked_display = f"@{liked_tg}" if liked_tg else (liked_doc.get("name") or "Someone")
 
             # Notify the liker (user who just tapped "Connect")
             try:
-                await context.bot.send_message(user_id, f"💞 It's a mutual connection! You and {mention_for_liker} expressed interest. Feel free to chat and exchange details.")
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"💞 It's a mutual connection! You and {liked_display} expressed interest. Feel free to chat and exchange details."
+                )
             except Exception:
-                logger.debug("Couldn't notify liker about mutual match.")
+                logger.exception("Couldn't notify liker about mutual match (user_id=%s, liked_id=%s).", user_id, liked_id)
 
-            # Notify the liked (the one who previously liked)
+            # Notify the liked (the one who previously liked); include the liker's username if available
             try:
-                await context.bot.send_message(liked_id, f"💞 It's a mutual connection! You and {mention_for_liked} expressed interest. Feel free to chat and exchange details.")
+                await context.bot.send_message(
+                    chat_id=liked_id,
+                    text=f"💞 It's a mutual connection! You and {liker_display} expressed interest. Feel free to chat and exchange details."
+                )
             except Exception:
-                logger.debug("Couldn't notify liked about mutual match.")
-        except Exception as e:
-            logger.warning("Failed to send mutual notification: %s", e)
+                logger.exception("Couldn't notify liked about mutual match (liked_id=%s, user_id=%s).", liked_id, user_id)
+        except Exception:
+            logger.exception("Failed to send mutual connection notifications for %s <-> %s", user_id, liked_id)
     else:
-        # Notify the liked user that someone is interested (offer to show profile)
+        # Notify the liked user that someone is interested and offer to show their profile
         try:
             keyboard = InlineKeyboardMarkup([
                 [
@@ -621,11 +795,10 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=liked_id,
                 text="💌 Someone on AAU-LinkUp is interested in connecting with you. Would you like to see their profile?",
-                parse_mode="Markdown",
                 reply_markup=keyboard
             )
-        except Exception as e:
-            logger.warning("Failed to send like notification to %s: %s", liked_id, e)
+        except Exception:
+            logger.exception("Failed to send like notification to %s from %s.", liked_id, user_id)
 
     # Continue showing matches
     await find_match(update, context)
@@ -721,6 +894,7 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("📊 View Leaderboard", callback_data="leaderboard")],
         [InlineKeyboardButton("📢 Broadcast Message", callback_data="broadcast")],
+        [InlineKeyboardButton("❗ View Open Reports", callback_data="admin_list_reports")]
     ]
     await safe_edit_or_send_message(update, "🛠 Admin Panel:", reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -766,6 +940,12 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_like, pattern=r"^like_"))
     app.add_handler(CallbackQueryHandler(show_liker_profile, pattern=r"^show_liker_"))
     app.add_handler(CallbackQueryHandler(ignore_like, pattern="ignore_like"))
+
+    # Admin action handlers
+    app.add_handler(CallbackQueryHandler(lambda u, c: None, pattern=r"^admin_list_reports$"))  # placeholder if you want to implement listing
+    app.add_handler(CallbackQueryHandler(handle_buttons, pattern=r"^admin_view_"))  # route to handle_buttons for admin_view_
+    app.add_handler(CallbackQueryHandler(handle_buttons, pattern=r"^admin_ban_"))  # route to handle_buttons for admin_ban_
+    app.add_handler(CallbackQueryHandler(handle_buttons, pattern=r"^admin_ignore_"))  # route to handle_buttons for admin_ignore_
 
     # --- Keep this last! (generic handler) ---
     app.add_handler(CallbackQueryHandler(handle_buttons))
