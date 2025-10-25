@@ -82,9 +82,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         users_collection.update_one({"user_id": user_id}, {"$set": {"tg_username": tg_username}})
         keyboard = [[InlineKeyboardButton("🌟 Main Menu", callback_data="main_menu")]]
         if update.message:
-            await update.message.reply_text("Welcome back! {privacy_note}, Use the menu below.", reply_markup=InlineKeyboardMarkup(keyboard))
+            await update.message.reply_text("Welcome back!, Use the menu below.", reply_markup=InlineKeyboardMarkup(keyboard))
         else:
-            await safe_edit_or_send_message(update, "Welcome back! {privacy_note}, Use the menu below.", reply_markup=InlineKeyboardMarkup(keyboard))
+            await safe_edit_or_send_message(update, "Welcome back!, Use the menu below.", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     users_collection.insert_one({
