@@ -934,8 +934,9 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
     # --- Callback Query Handlers (specific ones first) ---
-    app.add_handler(CallbackQueryHandler(handle_like, pattern=r"^like_"))
+
     app.add_handler(CallbackQueryHandler(show_liker_profile, pattern=r"^show_liker_"))
+    app.add_handler(CallbackQueryHandler(handle_like, pattern=r"^like_"))
     app.add_handler(CallbackQueryHandler(ignore_like, pattern="ignore_like"))
 
     # Admin action handlers
