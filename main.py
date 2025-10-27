@@ -699,6 +699,7 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ------------------- LIKE HANDLER -------------------
 # ------------------- LIKE HANDLER -------------------
+# ------------------- LIKE HANDLER -------------------
 async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query:
@@ -721,40 +722,42 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("You can't like yourself.")
         return
 
-    # Load users
+    # Load both users
     liker = ensure_user_doc(users_collection.find_one({"user_id": user_id}))
     liked = ensure_user_doc(users_collection.find_one({"user_id": liked_id}))
     if not liked.get("user_id"):
         await query.answer("User not found.")
         return
 
-    # Prevent double likes
+    # Prevent duplicate likes
     if liked_id in (liker.get("likes") or []):
         await query.answer("You've already connected with this user.")
         await find_match(update, context)
         return
 
-    # Save likes
+    # Update likes and liked_by
     users_collection.update_one({"user_id": user_id}, {"$addToSet": {"likes": liked_id}})
     users_collection.update_one({"user_id": liked_id}, {"$addToSet": {"liked_by": user_id}})
 
-    # ✅ Re-fetch *both* docs fresh from DB to check real-time mutual status
-    liker_doc = users_collection.find_one({"user_id": user_id})
-    liked_doc = users_collection.find_one({"user_id": liked_id})
+    # ✅ Re-fetch both docs fresh from DB (fixes mutual detection timing)
+    liker_doc = ensure_user_doc(users_collection.find_one({"user_id": user_id}))
+    liked_doc = ensure_user_doc(users_collection.find_one({"user_id": liked_id}))
 
     liked_name = liked_doc.get("name", "Someone")
+    liked_likes = liked_doc.get("likes", [])
+    mutual = user_id in liked_likes
+
     await query.answer(f"You liked {liked_name} ❤️")
 
     liked_tg = liked_doc.get("tg_username")
     liker_tg = liker_doc.get("tg_username")
 
-    # ✅ Real mutual check with fresh data
-    mutual = user_id in (liked_doc.get("likes") or [])
-
     if mutual:
+        # Display names
         liker_display = f"@{liker_tg}" if liker_tg else (liker_doc.get("name") or "Someone")
         liked_display = f"@{liked_tg}" if liked_tg else (liked_doc.get("name") or "Someone")
 
+        # Notify both users
         try:
             await context.bot.send_message(
                 chat_id=user_id,
@@ -764,19 +767,19 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=liked_id,
                 text=f"💞 It's a mutual connection! You and {liker_display} liked each other!"
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Failed to send mutual messages: {e}")
 
         await safe_edit_or_send_callback(
             query,
-            f"💞 It's a mutual connection with {liked_display}! You can start chatting now.",
+            f"💞 It's a mutual connection with {liked_display}! You can start chatting!",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")]
             ])
         )
         return
 
-    # Non-mutual notification
+    # If not mutual, notify the liked user
     try:
         keyboard = InlineKeyboardMarkup([
             [
@@ -786,13 +789,13 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         await context.bot.send_message(
             chat_id=liked_id,
-            text="💌 Someone just showed interest in you on AAU-LinkUp! Want to see who it is?",
+            text="💌 Someone expressed interest in you on AAU-LinkUp. Want to see who it is?",
             reply_markup=keyboard
         )
-    except Exception:
-        logger.exception("Failed to send like notification.")
+    except Exception as e:
+        logger.error(f"Failed to send like notification: {e}")
 
-    # Continue showing new match
+    # Move to next match
     await find_match(update, context)
 
 
