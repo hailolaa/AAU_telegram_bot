@@ -82,10 +82,21 @@ def ensure_user_doc(doc):
             doc[k] = v
     return doc
 
+# Helper to keep Telegram username in DB up-to-date.
+def upsert_tg_username(user_id, username):
+    if username:
+        try:
+            users_collection.update_one({"user_id": user_id}, {"$set": {"tg_username": username}})
+        except Exception:
+            logger.exception("Failed to upsert tg_username for user %s", user_id)
+
 # ------------------- START -------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     tg_username = update.effective_user.username
+    # ensure we persist username on /start
+    upsert_tg_username(user_id, tg_username)
+
     user = users_collection.find_one({"user_id": user_id})
     if user:
         users_collection.update_one({"user_id": user_id}, {"$set": {"tg_username": tg_username}})
@@ -119,6 +130,9 @@ async def start_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user_id = query.from_user.id
     tg_username = query.from_user.username
+    # persist username on callbacks too
+    upsert_tg_username(user_id, tg_username)
+
     users_collection.update_one({"user_id": user_id}, {"$set": {"step": "awaiting_name", "tg_username": tg_username}})
     await safe_edit_or_send_callback(query, "First, your name?:", parse_mode="Markdown")
 
@@ -309,6 +323,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
+    # persist username on any callback
+    upsert_tg_username(user_id, query.from_user.username)
+
     user = ensure_user_doc(users_collection.find_one({"user_id": user_id}))
     chat_id = query.message.chat_id
     data = query.data
@@ -565,6 +582,12 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # This function can be called by callback_query or by a normal message
     user_id = update.callback_query.from_user.id if update.callback_query else update.effective_user.id
+    # persist username
+    if update.callback_query:
+        upsert_tg_username(user_id, update.callback_query.from_user.username)
+    else:
+        upsert_tg_username(user_id, update.effective_user.username)
+
     user = users_collection.find_one({"user_id": user_id})
     if not user:
         await safe_edit_or_send_message(update, "No profile found.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🌟 Main Menu", callback_data="main_menu")]]))
@@ -624,6 +647,9 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
+    # persist username on match actions
+    upsert_tg_username(user_id, query.from_user.username)
+
     user = ensure_user_doc(users_collection.find_one({"user_id": user_id}))
 
     search_query = {"user_id": {"$ne": user_id}, "step": "done", "banned": {"$ne": True}}
@@ -708,6 +734,9 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = query.from_user.id
+    # persist username of the user pressing like
+    upsert_tg_username(user_id, query.from_user.username)
+
     if not query.data or "_" not in query.data:
         await query.answer("Invalid action")
         return
@@ -742,6 +771,10 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ✅ Re-fetch both docs fresh from DB (fixes mutual detection timing)
     liker_doc = ensure_user_doc(users_collection.find_one({"user_id": user_id}))
     liked_doc = ensure_user_doc(users_collection.find_one({"user_id": liked_id}))
+
+    # Logging to help debugging mutual-like edge cases
+    logger.debug("handle_like: user %s likes %s", user_id, liked_id)
+    logger.debug("liker_doc.likes=%s liked_doc.likes=%s", liker_doc.get("likes"), liked_doc.get("likes"))
 
     liked_name = liked_doc.get("name", "Someone")
     liked_likes = liked_doc.get("likes", [])
@@ -805,6 +838,9 @@ async def show_liker_profile(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     data = query.data
+
+    # persist username on this callback too
+    upsert_tg_username(query.from_user.id, query.from_user.username)
 
     try:
         liker_id = int(data.split("_", 2)[2])
@@ -934,7 +970,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
     # --- Callback Query Handlers (specific ones first) ---
-
+    # It's important that specific callback patterns are added before the generic handler below.
     app.add_handler(CallbackQueryHandler(show_liker_profile, pattern=r"^show_liker_"))
     app.add_handler(CallbackQueryHandler(handle_like, pattern=r"^like_"))
     app.add_handler(CallbackQueryHandler(ignore_like, pattern="ignore_like"))
