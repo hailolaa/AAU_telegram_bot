@@ -703,7 +703,6 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query:
         await query.answer()
     else:
-        # Shouldn't happen, but guard
         return
 
     user_id = query.from_user.id
@@ -721,7 +720,7 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("You can't like yourself.")
         return
 
-    # Load docs (ensure defaults)
+    # Load user data
     liker = ensure_user_doc(users_collection.find_one({"user_id": user_id}))
     liked = ensure_user_doc(users_collection.find_one({"user_id": liked_id}))
 
@@ -729,92 +728,74 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("User not found.")
         return
 
-    # Prevent duplicate likes from the same user (explicit check)
+    # If already liked, skip
     if liked_id in (liker.get("likes") or []):
         await query.answer("You've already connected with this user.")
-        # Continue showing matches without re-notifying
         await find_match(update, context)
         return
 
-    # Update like lists (use addToSet as safety)
+    # Save likes
     users_collection.update_one({"user_id": user_id}, {"$addToSet": {"likes": liked_id}})
     users_collection.update_one({"user_id": liked_id}, {"$addToSet": {"liked_by": user_id}})
 
-    # Check for mutual like: whether the liked user already has the liker in their "likes"
-    # (we check DB for the liked user's likes array)
-    mutual = users_collection.find_one({"user_id": liked_id, "likes": user_id}) is not None
-    logger.info("handle_like: user=%s liked=%s mutual=%s", user_id, liked_id, mutual)
-
-    # Refresh liked_doc for display name
+    # Fetch fresh liked_doc to check updated info
     liked_doc = users_collection.find_one({"user_id": liked_id})
     liked_name = liked_doc.get("name", "Someone")
+
+    # ✅ Check mutual after DB update
+    liked_likes = liked_doc.get("likes", [])
+    mutual = user_id in liked_likes
+
     await query.answer(f"You liked {liked_name} ❤️")
 
-    # Prepare documents used for mention / messaging
-    try:
-        liker_doc = users_collection.find_one({"user_id": user_id})
-        liked_tg = liked_doc.get("tg_username")
-        liker_tg = liker_doc.get("tg_username")
-    except Exception:
-        liked_tg = None
-        liker_tg = None
+    liker_doc = users_collection.find_one({"user_id": user_id})
+    liked_tg = liked_doc.get("tg_username")
+    liker_tg = liker_doc.get("tg_username")
 
     if mutual:
-        # Mutual connection: notify both users and include username/mention for the liker
+        liker_display = f"@{liker_tg}" if liker_tg else (liker_doc.get("name") or "Someone")
+        liked_display = f"@{liked_tg}" if liked_tg else (liked_doc.get("name") or "Someone")
+
+        # Notify both
         try:
-            # Use username if available, otherwise fall back to display name.
-            liker_display = f"@{liker_tg}" if liker_tg else (liker_doc.get("name") or "Someone")
-            liked_display = f"@{liked_tg}" if liked_tg else (liked_doc.get("name") or "Someone")
-
-            # Notify the liker (user who just tapped "Connect")
-            try:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"💞 It's a mutual connection! You and {liked_display} expressed interest. Feel free to chat and exchange details."
-                )
-            except Exception:
-                logger.exception("Couldn't notify liker about mutual match (user_id=%s, liked_id=%s).", user_id, liked_id)
-
-            # Notify the liked (the one who previously liked); include the liker's username if available
-            try:
-                await context.bot.send_message(
-                    chat_id=liked_id,
-                    text=f"💞 It's a mutual connection! You and {liker_display} expressed interest. Feel free to chat and exchange details."
-                )
-            except Exception:
-                logger.exception("Couldn't notify liked about mutual match (liked_id=%s, user_id=%s).", liked_id, user_id)
-
-            # Also update the current inline message to reflect the mutual match (so user sees immediate feedback
-            # and the bot does not silently proceed to the next match)
-            try:
-                await safe_edit_or_send_callback(query, f"💞 It's a mutual connection with {liked_display}! Check your messages.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")]]))
-            except Exception:
-                # best effort; ignore failures here
-                logger.debug("Couldn't edit callback message to show mutual confirmation.")
-        except Exception:
-            logger.exception("Failed to send mutual connection notifications for %s <-> %s", user_id, liked_id)
-
-        # Important: do NOT immediately call find_match here — user should see the match confirmation.
-        return
-    else:
-        # Notify the liked user that someone is interested and offer to show their profile
-        try:
-            keyboard = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("👀 Show Profile", callback_data=f"show_liker_{user_id}"),
-                    InlineKeyboardButton("❌ Skip", callback_data="ignore_like")
-                ]
-            ])
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"💞 It's a mutual connection! You and {liked_display} liked each other!"
+            )
             await context.bot.send_message(
                 chat_id=liked_id,
-                text="💌 Someone on AAU-LinkUp is interested in connecting with you. Would you like to see their profile?",
-                reply_markup=keyboard
+                text=f"💞 It's a mutual connection! You and {liker_display} liked each other!"
             )
         except Exception:
-            logger.exception("Failed to send like notification to %s from %s.", liked_id, user_id)
+            pass
 
-    # Continue showing matches (only in non-mutual scenario)
+        # Show confirmation
+        await safe_edit_or_send_callback(
+            query,
+            f"💞 It's a mutual connection with {liked_display}!, u can start chatting ",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")]])
+        )
+        return
+
+    # Non-mutual — notify liked user
+    try:
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("👀 Show Profile", callback_data=f"show_liker_{user_id}"),
+                InlineKeyboardButton("❌ Skip", callback_data="ignore_like")
+            ]
+        ])
+        await context.bot.send_message(
+            chat_id=liked_id,
+            text="💌 Someone express Interest in you on AAU-LinkUp. Want to see who it is?",
+            reply_markup=keyboard
+        )
+    except Exception:
+        logger.exception("Failed to send like notification.")
+
+    # Continue with next match
     await find_match(update, context)
+
 
 
 async def show_liker_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
