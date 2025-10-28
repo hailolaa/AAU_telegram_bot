@@ -425,6 +425,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("💖 Find Match", callback_data="find_match")],
         [InlineKeyboardButton("👤 View Profile", callback_data="view_profile")],
         [InlineKeyboardButton("✏️ Edit Profile", callback_data="edit_profile")],
+        [InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard")],
         [InlineKeyboardButton("❓ Help", callback_data="help_command")],  # Added help button
     ]
     if update.effective_user.id in ADMIN_IDS:
@@ -583,6 +584,7 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
 async def show_liker_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -594,7 +596,7 @@ async def show_liker_profile(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("Invalid user.")
         return
 
-    liker = users_collection.find_one({"user_id": liker_id})
+    liker = ensure_user_doc(users_collection.find_one({"user_id": liker_id}))
     if not liker:
         await query.answer("User not found.")
         return
@@ -633,9 +635,6 @@ async def show_liker_profile(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode="Markdown",
             reply_markup=match_keyboard
         )
-
-
-
 
 # ------------------- LEADERBOARD -------------------
 async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -739,7 +738,7 @@ def main():
 
 
 
-    # Set webhook with Telegram
+ # Set webhook with Telegram
     app.run_webhook(
     listen="0.0.0.0",
     port=PORT,
@@ -750,3 +749,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
