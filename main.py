@@ -928,9 +928,11 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
     liker_tg = liker_doc.get("tg_username")
 
     if mutual:
-        # Display names
-        liker_display = f"@{liker_tg}" if liker_tg else (liker_doc.get("name") or "Someone")
-        liked_display = f"@{liked_tg}" if liked_tg else (liked_doc.get("name") or "Someone")
+        # Prepare names and mentions
+        liker_name = liker_doc.get("name") or "Someone"
+        liked_name_only = liked_doc.get("name") or "Someone"
+        liked_mention = f"@{liked_tg}" if liked_tg else None
+        liker_mention = f"@{liker_tg}" if liker_tg else None
 
         # mark any queued/sent notifications related to this mutual like as responded/cancelled
         try:
@@ -939,26 +941,20 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             logger.exception("Error marking notifications on mutual like for %s -> %s", user_id, liked_id)
 
-        # Notify both users
+        # Notify both users (single message each), include TG username if available
         try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"💞 It's a mutual connection! You and {liked_display} liked each other!"
-            )
-            await context.bot.send_message(
-                chat_id=liked_id,
-                text=f"💞 It's a mutual connection! You and {liker_display} liked each other!"
-            )
+            msg_to_liker = f"💞 It's a mutual connection! You and {liked_name_only} liked each other!"
+            if liked_mention:
+                msg_to_liker += f" Feel free to chat {liked_mention}"
+            await context.bot.send_message(chat_id=user_id, text=msg_to_liker)
+
+            msg_to_liked = f"💞 It's a mutual connection! You and {liker_name} liked each other!"
+            if liker_mention:
+                msg_to_liked += f" Feel free to chat {liker_mention}"
+            await context.bot.send_message(chat_id=liked_id, text=msg_to_liked)
         except Exception as e:
             logger.error(f"Failed to send mutual messages: {e}")
 
-        await safe_edit_or_send_callback(
-            query,
-            f"💞 It's a mutual connection with {liked_display}! You can start chatting!",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")]
-            ])
-        )
         # After responding, try to deliver next queued notification to the liked user (they just responded)
         try:
             await try_deliver_next_notification(liked_id, context)
