@@ -2,7 +2,7 @@ import logging
 import random
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -34,9 +34,13 @@ client = MongoClient(MONGO_URI) if MONGO_URI else MongoClient()
 db = client["unimatch_bot2"]
 users_collection = db["users"]
 reports_collection = db["reports"]  # new collection to persist reports
+like_notifications_collection = db["like_notifications"]  # new collection to queue and manage like notifications
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Minimum gap between "someone liked you" notifications if user didn't respond
+NOTIFICATION_MIN_GAP = timedelta(minutes=30)
 
 # ------------------- UTILITIES -------------------
 async def safe_edit_or_send_callback(query, text, reply_markup=None, parse_mode=None):
@@ -89,6 +93,142 @@ def upsert_tg_username(user_id, username):
             users_collection.update_one({"user_id": user_id}, {"$set": {"tg_username": username}})
         except Exception:
             logger.exception("Failed to upsert tg_username for user %s", user_id)
+
+
+# ------------------- LIKE NOTIFICATION QUEUE HELPERS -------------------
+def _get_current_utc():
+    return datetime.utcnow()
+
+def _has_recent_unresponded_sent(recipient_id):
+    """
+    Return True if there exists a 'sent' notification for recipient that was sent within NOTIFICATION_MIN_GAP and is still awaiting response.
+    """
+    recent = like_notifications_collection.find_one({
+        "recipient_id": recipient_id,
+        "status": "sent",
+    }, sort=[("sent_at", -1)])
+    if not recent:
+        return False
+    sent_at = recent.get("sent_at")
+    if not sent_at:
+        return False
+    return (_get_current_utc() - sent_at) < NOTIFICATION_MIN_GAP
+
+
+def queue_like_notification(liker_id, recipient_id):
+    """
+    Persist a like notification in the queue. Return the inserted doc id (string).
+    """
+    doc = {
+        "recipient_id": recipient_id,
+        "liker_id": liker_id,
+        "created_at": _get_current_utc(),
+        "sent_at": None,
+        "status": "queued",  # queued | sent | responded | cancelled
+        "response": None,  # store action like 'viewed','ignored','liked_back'
+    }
+    try:
+        res = like_notifications_collection.insert_one(doc)
+        return str(res.inserted_id)
+    except Exception:
+        logger.exception("Failed to insert like notification for recipient %s from liker %s", recipient_id, liker_id)
+        return None
+
+
+async def try_deliver_next_notification(recipient_id, context: ContextTypes.DEFAULT_TYPE):
+    """
+    If recipient has no current 'sent' (awaiting-response) notification and there are queued notifications,
+    deliver the latest queued one immediately. Returns True if a notification was sent.
+    """
+    # If there is currently an unresponded sent notification within the gap, do not deliver more
+    if _has_recent_unresponded_sent(recipient_id):
+        logger.debug("Recipient %s has recent unresponded sent notification; skipping delivery", recipient_id)
+        return False
+
+    # Ensure no 'sent' notifications exist (even older ones) that are awaiting response. We'll treat only status=='sent' as awaiting.
+    existing_sent = like_notifications_collection.find_one({"recipient_id": recipient_id, "status": "sent"})
+    if existing_sent:
+        # if it's old (older than gap), allow new delivery; otherwise skip (but _has_recent_unresponded_sent already checked)
+        sent_at = existing_sent.get("sent_at")
+        if sent_at and (_get_current_utc() - sent_at) < NOTIFICATION_MIN_GAP:
+            logger.debug("Existing sent notification is still in gap window for recipient %s", recipient_id)
+            return False
+        # else we allow sending another; mark the old as cancelled to avoid duplicates
+        try:
+            like_notifications_collection.update_one({"_id": existing_sent["_id"]}, {"$set": {"status": "cancelled"}})
+        except Exception:
+            logger.exception("Failed to cancel old sent notification for recipient %s", recipient_id)
+
+    # pick the latest queued notification (user asked to show latest immediately)
+    queued = like_notifications_collection.find_one({"recipient_id": recipient_id, "status": "queued"}, sort=[("created_at", -1)])
+    if not queued:
+        logger.debug("No queued notifications for recipient %s", recipient_id)
+        return False
+
+    # attempt to send
+    try:
+        liker_id = queued["liker_id"]
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("👀 Show Profile", callback_data=f"show_liker_{liker_id}"),
+                InlineKeyboardButton("❌ Skip", callback_data="ignore_like")
+            ]
+        ])
+        await context.bot.send_message(
+            chat_id=recipient_id,
+            text="💌 Someone expressed interest in you on AAU-LinkUp. Want to see who it is?",
+            reply_markup=keyboard
+        )
+        # mark as sent
+        like_notifications_collection.update_one(
+            {"_id": queued["_id"]},
+            {"$set": {"status": "sent", "sent_at": _get_current_utc()}}
+        )
+        logger.info("Delivered like notification %s to recipient %s", str(queued.get("_id")), recipient_id)
+        return True
+    except Exception:
+        logger.exception("Failed to deliver queued like notification %s to recipient %s", str(queued.get("_id")), recipient_id)
+        # leave it queued to retry later
+        return False
+
+
+async def handle_new_like_notification(liker_id, recipient_id, context: ContextTypes.DEFAULT_TYPE):
+    """
+    High-level handler called when A likes B (non-mutual). It queues the notification and tries to deliver immediately
+    unless a recent unresponded notification exists for the recipient.
+    """
+    # persist notification
+    nid = queue_like_notification(liker_id, recipient_id)
+    if not nid:
+        return
+
+    # If recipient has a currently sent notification within gap and not responded, do not send now.
+    if _has_recent_unresponded_sent(recipient_id):
+        logger.debug("Queued notification %s for recipient %s due to recent sent", nid, recipient_id)
+        return
+
+    # Otherwise, try to deliver immediately
+    await try_deliver_next_notification(recipient_id, context)
+
+
+async def mark_notifications_responded(recipient_id, liker_id=None, response_type="viewed"):
+    """
+    Mark the most recent 'sent' notification(s) for recipient as responded.
+    If liker_id is provided, only mark the matching notification for that liker_id.
+    """
+    query = {"recipient_id": recipient_id, "status": "sent"}
+    if liker_id is not None:
+        query["liker_id"] = liker_id
+
+    try:
+        docs = list(like_notifications_collection.find(query))
+        for d in docs:
+            like_notifications_collection.update_one({"_id": d["_id"]}, {
+                "$set": {"status": "responded", "response": response_type, "responded_at": _get_current_utc()}
+            })
+    except Exception:
+        logger.exception("Failed to mark notifications responded for recipient %s liker %s", recipient_id, liker_id)
+
 
 # ------------------- START -------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -673,13 +813,15 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
     filtered = [c for c in candidates if eligible(c)]
 
     # If no profiles left to show, reset passed and likes
+        # If no profiles left to show, reset only 'passed' (keep 'likes'!)
     if not filtered:
         users_collection.update_one(
             {"user_id": user_id},
-            {"$set": {"passed": [], "likes": []}}
+            {"$set": {"passed": []}}  # keep likes intact
         )
+        # Recompute with the same eligibility (still excluding already liked users)
         candidates = list(users_collection.find(search_query))
-        filtered = [c for c in candidates if c.get("user_id") != user_id]
+        filtered = [c for c in candidates if eligible(c)]
 
         if not filtered:
             keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")]]
@@ -690,7 +832,7 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         else:
-            await query.message.reply_text("✨ You've seen everyone! Starting fresh...")
+            await query.message.reply_text("✨ You've seen everyone you haven't liked yet!")
 
     candidate = random.choice(filtered)
     caption = (
@@ -790,6 +932,13 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
         liker_display = f"@{liker_tg}" if liker_tg else (liker_doc.get("name") or "Someone")
         liked_display = f"@{liked_tg}" if liked_tg else (liked_doc.get("name") or "Someone")
 
+        # mark any queued/sent notifications related to this mutual like as responded/cancelled
+        try:
+            # For the person who was previously notified (liked_id), mark notifications where liker == user_id
+            await mark_notifications_responded(liked_id, liker_id=user_id, response_type="liked_back")
+        except Exception:
+            logger.exception("Error marking notifications on mutual like for %s -> %s", user_id, liked_id)
+
         # Notify both users
         try:
             await context.bot.send_message(
@@ -810,23 +959,18 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")]
             ])
         )
+        # After responding, try to deliver next queued notification to the liked user (they just responded)
+        try:
+            await try_deliver_next_notification(liked_id, context)
+        except Exception:
+            logger.exception("Failed to deliver next notification after mutual like for %s", liked_id)
         return
 
-    # If not mutual, notify the liked user
+    # If not mutual, queue and maybe notify (rate-limited)
     try:
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("👀 Show Profile", callback_data=f"show_liker_{user_id}"),
-                InlineKeyboardButton("❌ Skip", callback_data="ignore_like")
-            ]
-        ])
-        await context.bot.send_message(
-            chat_id=liked_id,
-            text="💌 Someone expressed interest in you on AAU-LinkUp. Want to see who it is?",
-            reply_markup=keyboard
-        )
-    except Exception as e:
-        logger.error(f"Failed to send like notification: {e}")
+        await handle_new_like_notification(user_id, liked_id, context)
+    except Exception:
+        logger.exception("Failed to handle new like notification for %s -> %s", user_id, liked_id)
 
     # Move to next match
     await find_match(update, context)
@@ -873,6 +1017,14 @@ async def show_liker_profile(update: Update, context: ContextTypes.DEFAULT_TYPE)
             InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")
         ]
     ])
+
+    # Mark the corresponding sent notification as responded (they viewed)
+    try:
+        await mark_notifications_responded(query.from_user.id, liker_id=liker_id, response_type="viewed")
+        # After responding, if there are queued notifications, try to deliver the latest immediately
+        await try_deliver_next_notification(query.from_user.id, context)
+    except Exception:
+        logger.exception("Error marking/delivering notifications after show_liker_profile for %s", query.from_user.id)
 
     if photos:
         await query.message.reply_photo(
@@ -955,6 +1107,13 @@ async def ignore_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Simple acknowledgement for the 'skip' button on like notification
     if update.callback_query:
         await update.callback_query.answer("Skipped ❤️")
+        # mark sent notifications as responded/ignored
+        try:
+            await mark_notifications_responded(update.callback_query.from_user.id, response_type="ignored")
+            # After ignoring, attempt to deliver next queued notification immediately
+            await try_deliver_next_notification(update.callback_query.from_user.id, context)
+        except Exception:
+            logger.exception("Failed to mark/deliver notifications after ignore_like for %s", update.callback_query.from_user.id)
 
 # ------------------- APP SETUP -------------------
 def main():
