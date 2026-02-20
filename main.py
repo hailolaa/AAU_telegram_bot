@@ -548,13 +548,18 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "edit_profile":
+        is_verified = user.get("is_verified", False)
         keyboard = [
             [InlineKeyboardButton("👤 Name", callback_data="edit_name"), InlineKeyboardButton("🎂 Age", callback_data="edit_age")],
             [InlineKeyboardButton("⚧ Gender", callback_data="edit_gender"), InlineKeyboardButton("🎓 Department", callback_data="edit_department")],
             [InlineKeyboardButton("📅 Year", callback_data="edit_year"), InlineKeyboardButton("📝 Bio", callback_data="edit_bio")],
             [InlineKeyboardButton("📸 Photo", callback_data="edit_photo")],
-            [InlineKeyboardButton("🔙 Back", callback_data="main_menu")]
         ]
+        if not is_verified:
+            keyboard.append([InlineKeyboardButton("� Verify Email", callback_data="choice_verify_email")])
+        else:
+            keyboard.append([InlineKeyboardButton("✅ Verified", callback_data="already_verified")])
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
         edit_text = (
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "    ✏️ *Edit Profile*\n"
@@ -585,6 +590,14 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         interest = data.split("_", 1)[1]
         users_collection.update_one({"user_id": user_id}, {"$set": {"interested_in": interest, "step": "awaiting_bio"}})
         await safe_edit_or_send_callback(query, "📋 *Step 8 of 8* · Bio\n●●●●●●●○○○ 80%\n\n📝 Almost done! Write a short *bio* — vibes, goals, or hobbies:", parse_mode="Markdown")
+        return
+
+    if data == "help_command":
+        await help_command(update, context)
+        return
+
+    if data == "already_verified":
+        await safe_edit_or_send_callback(query, "✅ Your email is already verified! You have the *Verified 🛡* badge.", parse_mode="Markdown")
         return
 
     if data == "view_profile":
@@ -810,7 +823,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gender_icon = "🙋‍♂️" if user.get('gender') == 'male' else "🙋‍♀️" if user.get('gender') == 'female' else "👤"
     text = (
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"  {gender_icon} *{user.get('name')}*{verified_badge}\n"
+        f"  {gender_icon} {user.get('name')}{verified_badge}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🎓  {user.get('department')}  ·  📅 {user.get('year')}\n"
         f"🎂  {user.get('age')} years old\n\n"
@@ -844,16 +857,16 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("💖 Find Match", callback_data="find_match"), InlineKeyboardButton("👤 Profile", callback_data="view_profile")],
-        [InlineKeyboardButton("✏️ Edit", callback_data="edit_profile"), InlineKeyboardButton("🏆 Ranks", callback_data="leaderboard")],
-        [InlineKeyboardButton("❓ Help", callback_data="help_command")],
+        [InlineKeyboardButton("✏️ Edit", callback_data="edit_profile"), InlineKeyboardButton("❓ Help", callback_data="help_command")],
     ]
     if update.effective_user.id in ADMIN_IDS:
+        keyboard.insert(2, [InlineKeyboardButton("🏆 Ranks", callback_data="leaderboard")])
         keyboard.append([InlineKeyboardButton("🛠 Admin", callback_data="admin_panel")])
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     menu_text = (
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "    💎 *UniMatch Menu*\n"
+        "    💎 *Menu*\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "What would you like to do?"
     )
@@ -1187,6 +1200,69 @@ async def ignore_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             logger.exception("Failed to mark/deliver notifications after ignore_like for %s", update.callback_query.from_user.id)
 
+
+# ------------------- ADMIN REPORTS LISTING -------------------
+async def show_admin_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.answer()
+        user_id = query.from_user.id
+    else:
+        user_id = update.effective_user.id
+
+    if user_id not in ADMIN_IDS:
+        await safe_edit_or_send_message(update, "⛔ Only admins can view reports.")
+        return
+
+    # Fetch open reports (latest 10)
+    open_reports = list(reports_collection.find(
+        {"status": {"$in": ["open", "pending"]}}
+    ).sort("created_at", -1).limit(10))
+
+    if not open_reports:
+        no_reports_text = (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "   ✅ *No Open Reports*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "All clear! No reports pending review."
+        )
+        keyboard = [[InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel")]]
+        await safe_edit_or_send_message(update, no_reports_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    msg = (
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "   ⚠️ *Open Reports*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    )
+
+    keyboard = []
+    for i, report in enumerate(open_reports, 1):
+        target_id = report.get("target_id")
+        reporter_id = report.get("reporter_id")
+        report_id = str(report.get("_id"))
+        created = report.get("created_at")
+        time_str = created.strftime("%b %d, %H:%M") if created else "N/A"
+
+        # Look up names
+        target_user = users_collection.find_one({"user_id": target_id}) or {}
+        reporter_user = users_collection.find_one({"user_id": reporter_id}) or {}
+        target_name = target_user.get("name", "Unknown")
+        reporter_name = reporter_user.get("name", "Unknown")
+
+        msg += (
+            f"*{i}.* 🚫 {target_name}\n"
+            f"    Reported by: {reporter_name}\n"
+            f"    Time: {time_str}\n\n"
+        )
+        keyboard.append([
+            InlineKeyboardButton(f"👁 View #{i}", callback_data=f"admin_view_{target_id}"),
+            InlineKeyboardButton(f"❌ Ignore #{i}", callback_data=f"admin_ignore_{report_id}")
+        ])
+
+    keyboard.append([InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel")])
+    await safe_edit_or_send_message(update, msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+
 # ------------------- APP SETUP -------------------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -1207,7 +1283,7 @@ def main():
     app.add_handler(CallbackQueryHandler(ignore_like, pattern="ignore_like"))
 
     # Admin action handlers
-    app.add_handler(CallbackQueryHandler(lambda u, c: None, pattern=r"^admin_list_reports$"))  # placeholder if you want to implement listing
+    app.add_handler(CallbackQueryHandler(show_admin_reports, pattern=r"^admin_list_reports$"))
     app.add_handler(CallbackQueryHandler(handle_buttons, pattern=r"^admin_view_"))  # route to handle_buttons for admin_view_
     app.add_handler(CallbackQueryHandler(handle_buttons, pattern=r"^admin_ban_"))  # route to handle_buttons for admin_ban_
     app.add_handler(CallbackQueryHandler(handle_buttons, pattern=r"^admin_ignore_"))  # route to handle_buttons for admin_ignore_
