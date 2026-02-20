@@ -1,6 +1,8 @@
 import logging
 import random
 import os
+import sys
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -9,6 +11,7 @@ from telegram.ext import (
 )
 from pymongo import MongoClient
 from telegram.error import BadRequest
+from bson.objectid import ObjectId
 from aiohttp import web
 
 
@@ -16,34 +19,48 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
-ADMIN_IDS = [int(os.getenv("ADMIN_ID"))] if os.getenv("ADMIN_ID") else []
-ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID")) if os.getenv("ADMIN_CHANNEL_ID") else None  # <-- Add this line
+# Support multiple admin IDs separated by commas
+ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_ID", "").split(",") if x.strip()]
+ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID")) if os.getenv("ADMIN_CHANNEL_ID") else None
 WEBHOOK_PATH = "/webhook"
 PORT = int(os.getenv("PORT", 10000))
 BASE_URL = os.getenv("BASE_URL")  # e.g. https://your-app-name.onrender.com
 
 
+if not BOT_TOKEN:
+    print("ERROR: BOT_TOKEN is not set in environment.")
+    sys.exit(1)
 
-client = MongoClient(MONGO_URI)
-db = client["unimatch_bot"]
+client = MongoClient(MONGO_URI) if MONGO_URI else MongoClient()
+db = client["unimatch_bot2"]
 users_collection = db["users"]
+reports_collection = db["reports"]  # new collection to persist reports
+like_notifications_collection = db["like_notifications"]  # new collection to queue and manage like notifications
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Minimum gap between "someone liked you" notifications if user didn't respond
+NOTIFICATION_MIN_GAP = timedelta(minutes=30)
 
 # ------------------- UTILITIES -------------------
 async def safe_edit_or_send_callback(query, text, reply_markup=None, parse_mode=None):
     try:
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
     except BadRequest:
+        # Fallback to sending a new message in the same chat
         await query.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
 
 
 async def safe_edit_or_send_message(update, text, reply_markup=None, parse_mode=None):
-    if update.callback_query:
+    # Handles both callback_query and normal messages
+    if update and getattr(update, "callback_query", None):
         await safe_edit_or_send_callback(update.callback_query, text, reply_markup=reply_markup, parse_mode=parse_mode)
-    else:
+    elif update and getattr(update, "message", None):
         await update.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    else:
+        # As a last resort, log it
+        logger.warning("No update.message or update.callback_query available for sending message: %s", text)
 
 
 
@@ -75,18 +92,165 @@ def ensure_user_doc(doc):
             doc[k] = v
     return doc
 
+# Helper to keep Telegram username in DB up-to-date.
+def upsert_tg_username(user_id, username):
+    if username:
+        try:
+            users_collection.update_one({"user_id": user_id}, {"$set": {"tg_username": username}})
+        except Exception:
+            logger.exception("Failed to upsert tg_username for user %s", user_id)
+
+
+# ------------------- LIKE NOTIFICATION QUEUE HELPERS -------------------
+def _get_current_utc():
+    return datetime.utcnow()
+
+def _has_recent_unresponded_sent(recipient_id):
+    """
+    Return True if there exists a 'sent' notification for recipient that was sent within NOTIFICATION_MIN_GAP and is still awaiting response.
+    """
+    recent = like_notifications_collection.find_one({
+        "recipient_id": recipient_id,
+        "status": "sent",
+    }, sort=[("sent_at", -1)])
+    if not recent:
+        return False
+    sent_at = recent.get("sent_at")
+    if not sent_at:
+        return False
+    return (_get_current_utc() - sent_at) < NOTIFICATION_MIN_GAP
+
+
+def queue_like_notification(liker_id, recipient_id):
+    """
+    Persist a like notification in the queue. Return the inserted doc id (string).
+    """
+    doc = {
+        "recipient_id": recipient_id,
+        "liker_id": liker_id,
+        "created_at": _get_current_utc(),
+        "sent_at": None,
+        "status": "queued",  # queued | sent | responded | cancelled
+        "response": None,  # store action like 'viewed','ignored','liked_back'
+    }
+    try:
+        res = like_notifications_collection.insert_one(doc)
+        return str(res.inserted_id)
+    except Exception:
+        logger.exception("Failed to insert like notification for recipient %s from liker %s", recipient_id, liker_id)
+        return None
+
+
+async def try_deliver_next_notification(recipient_id, context: ContextTypes.DEFAULT_TYPE):
+    """
+    If recipient has no current 'sent' (awaiting-response) notification and there are queued notifications,
+    deliver the latest queued one immediately. Returns True if a notification was sent.
+    """
+    # If there is currently an unresponded sent notification within the gap, do not deliver more
+    if _has_recent_unresponded_sent(recipient_id):
+        logger.debug("Recipient %s has recent unresponded sent notification; skipping delivery", recipient_id)
+        return False
+
+    # Ensure no 'sent' notifications exist (even older ones) that are awaiting response. We'll treat only status=='sent' as awaiting.
+    existing_sent = like_notifications_collection.find_one({"recipient_id": recipient_id, "status": "sent"})
+    if existing_sent:
+        # if it's old (older than gap), allow new delivery; otherwise skip (but _has_recent_unresponded_sent already checked)
+        sent_at = existing_sent.get("sent_at")
+        if sent_at and (_get_current_utc() - sent_at) < NOTIFICATION_MIN_GAP:
+            logger.debug("Existing sent notification is still in gap window for recipient %s", recipient_id)
+            return False
+        # else we allow sending another; mark the old as cancelled to avoid duplicates
+        try:
+            like_notifications_collection.update_one({"_id": existing_sent["_id"]}, {"$set": {"status": "cancelled"}})
+        except Exception:
+            logger.exception("Failed to cancel old sent notification for recipient %s", recipient_id)
+
+    # pick the latest queued notification (user asked to show latest immediately)
+    queued = like_notifications_collection.find_one({"recipient_id": recipient_id, "status": "queued"}, sort=[("created_at", -1)])
+    if not queued:
+        logger.debug("No queued notifications for recipient %s", recipient_id)
+        return False
+
+    # attempt to send
+    try:
+        liker_id = queued["liker_id"]
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("👀 Show Profile", callback_data=f"show_liker_{liker_id}"),
+                InlineKeyboardButton("❌ Skip", callback_data="ignore_like")
+            ]
+        ])
+        await context.bot.send_message(
+            chat_id=recipient_id,
+            text="💌 Someone expressed interest in you on AAU-LinkUp. Want to see who it is?",
+            reply_markup=keyboard
+        )
+        # mark as sent
+        like_notifications_collection.update_one(
+            {"_id": queued["_id"]},
+            {"$set": {"status": "sent", "sent_at": _get_current_utc()}}
+        )
+        logger.info("Delivered like notification %s to recipient %s", str(queued.get("_id")), recipient_id)
+        return True
+    except Exception:
+        logger.exception("Failed to deliver queued like notification %s to recipient %s", str(queued.get("_id")), recipient_id)
+        # leave it queued to retry later
+        return False
+
+
+async def handle_new_like_notification(liker_id, recipient_id, context: ContextTypes.DEFAULT_TYPE):
+    """
+    High-level handler called when A likes B (non-mutual). It queues the notification and tries to deliver immediately
+    unless a recent unresponded notification exists for the recipient.
+    """
+    # persist notification
+    nid = queue_like_notification(liker_id, recipient_id)
+    if not nid:
+        return
+
+    # If recipient has a currently sent notification within gap and not responded, do not send now.
+    if _has_recent_unresponded_sent(recipient_id):
+        logger.debug("Queued notification %s for recipient %s due to recent sent", nid, recipient_id)
+        return
+
+    # Otherwise, try to deliver immediately
+    await try_deliver_next_notification(recipient_id, context)
+
+
+async def mark_notifications_responded(recipient_id, liker_id=None, response_type="viewed"):
+    """
+    Mark the most recent 'sent' notification(s) for recipient as responded.
+    If liker_id is provided, only mark the matching notification for that liker_id.
+    """
+    query = {"recipient_id": recipient_id, "status": "sent"}
+    if liker_id is not None:
+        query["liker_id"] = liker_id
+
+    try:
+        docs = list(like_notifications_collection.find(query))
+        for d in docs:
+            like_notifications_collection.update_one({"_id": d["_id"]}, {
+                "$set": {"status": "responded", "response": response_type, "responded_at": _get_current_utc()}
+            })
+    except Exception:
+        logger.exception("Failed to mark notifications responded for recipient %s liker %s", recipient_id, liker_id)
+
+
 # ------------------- START -------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     tg_username = update.effective_user.username
+    # ensure we persist username on /start
+    upsert_tg_username(user_id, tg_username)
+
     user = users_collection.find_one({"user_id": user_id})
     if user:
         users_collection.update_one({"user_id": user_id}, {"$set": {"tg_username": tg_username}})
         keyboard = [[InlineKeyboardButton("🌟 Main Menu", callback_data="main_menu")]]
         if update.message:
-            await update.message.reply_text("Welcome back ❤️ Use the menu below.", reply_markup=InlineKeyboardMarkup(keyboard))
+            await update.message.reply_text("Welcome back! Use the menu below.", reply_markup=InlineKeyboardMarkup(keyboard))
         else:
-            await safe_edit_or_send_message(update, "Welcome back ❤️ Use the menu below.", reply_markup=InlineKeyboardMarkup(keyboard))
+            await safe_edit_or_send_message(update, "Welcome back! Use the menu below.", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     users_collection.insert_one({
@@ -101,8 +265,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "year": ""
     })
     await update.message.reply_text(
-        "Hey 👋 Welcome to UniMatch!\nPress the button to start your campus journey:",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Join Registry", callback_data="start_onboarding")]])
+        "Hey 👋 Welcome to UniMatch!\nPress the button to start onboarding:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Start", callback_data="start_onboarding")]])
     )
 
 # ------------------- ONBOARDING -------------------
@@ -111,6 +275,9 @@ async def start_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user_id = query.from_user.id
     tg_username = query.from_user.username
+    # persist username on callbacks too
+    upsert_tg_username(user_id, tg_username)
+
     users_collection.update_one({"user_id": user_id}, {"$set": {"step": "awaiting_name", "tg_username": tg_username}})
     await safe_edit_or_send_callback(query, "Step 1: Your Identity 👤\n[▓░░░░░░░░░] 10%\n\n*What is your full name?*", parse_mode="Markdown")
 
@@ -124,15 +291,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = message.text.strip() if message.text else ""
 
     # Debugging line to check chat ID
-    print(f"Chat ID: {chat_id}")
+    logger.debug("Chat ID: %s", chat_id)
 
-    # Channel-driven broadcast
-    if chat_id == ADMIN_CHANNEL_ID and context.chat_data.get("awaiting_broadcast"):
+    # Broadcast flow support:
+    # - Admins can trigger broadcast from their private chat (using user_data)
+    # - Or from the configured admin control channel (using chat_data)
+    # Check admin user-data broadcast flag first (private admin)
+    user_id = message.chat_id
+    if user_id in ADMIN_IDS and context.user_data.get("awaiting_broadcast"):
         all_users = list(users_collection.find({}, {"user_id": 1}))
         sent = 0
         for u in all_users:
             try:
                 await context.bot.send_message(u["user_id"], f"📢 Broadcast from admin:\n\n{text}")
+                sent += 1
+            except Exception:
+                pass
+        context.user_data["awaiting_broadcast"] = False
+        await message.reply_text(f"Broadcast sent to {sent} users.")
+        return
+
+    # Channel-driven broadcast (if admin hits broadcast from the control channel)
+    if chat_id == ADMIN_CHANNEL_ID and context.chat_data.get("awaiting_broadcast"):
+        all_users = list(users_collection.find({}, {"user_id": 1}))
+        sent = 0
+        for u in all_users:
+            try:
+                await context.bot.send_message(u["user_id"], f"📢 Broadcast from admin channel:\n\n{text}")
                 sent += 1
             except Exception:
                 pass
@@ -144,7 +329,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if message.chat.type != "private":
         return
 
-    user_id = message.chat_id
+    # proceed with user onboarding/profile edits
     user = ensure_user_doc(users_collection.find_one({"user_id": user_id}))
     step = user.get("step")
 
@@ -178,81 +363,63 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if step == "awaiting_age":
         if not text.isdigit() or not (16 <= int(text) <= 100):
-            await update.message.reply_text("Please enter a valid age (16–100).")
+            await message.reply_text("Please enter a valid age (16–100).")
             return
         users_collection.update_one({"user_id": user_id}, {"$set": {"age": int(text), "step": "awaiting_photo"}})
-        await update.message.reply_text("Step 6: Appearance 📸\n[▓▓▓▓▓▓░░░░] 60%\n\n*Cool 😎 Now upload a high-quality profile photo:*", parse_mode="Markdown")
+        await update.message.reply_text("Cool 😎 Now upload a profile photo.")
         return
 
     if step == "awaiting_bio":
         if not text:
-            await update.message.reply_text("Please write a short bio about yourself.")
+            await message.reply_text("Please write a short bio about yourself.")
             return
-        users_collection.update_one({"user_id": user_id}, {"$set": {"bio": text, "step": "awaiting_icebreaker"}})
-        await message.reply_text(
-            "Step 9: Campus Vibe 💬\n[▓▓▓▓▓▓▓▓░░] 85%\n\n*Almost there! Choose one and answer:* \n1. Best gate to meet at?\n2. 6K vs 5K library?\n3. Hidden study spot?\n\n(Just reply with your answer)",
-            parse_mode="Markdown"
-        )
-        return
-
-    if step == "awaiting_icebreaker":
-        if not text:
-            await update.message.reply_text("Please provide an answer.")
-            return
-        users_collection.update_one({"user_id": user_id}, {"$set": {"icebreaker": text, "step": "awaiting_email_choice"}})
-        keyboard = [
-            [InlineKeyboardButton("📧 Verify Campus Email", callback_data="choice_verify_email")],
-            [InlineKeyboardButton("⏭️ Skip & Finish", callback_data="choice_skip_email")]
-        ]
-        await update.message.reply_text(
-            "Step 10: Verification 🛡\n[▓▓▓▓▓▓▓▓▓░] 95%\n\n*Final step! Would you like to verify your campus email (e.g., name-ug@aau.edu.et) to get the Verified Badge?*",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
+        users_collection.update_one({"user_id": user_id}, {"$set": {"bio": text, "step": "done"}})
+        await update.message.reply_text("Profile complete! 🎉")
+        await show_main_menu(update, context)
         return
 
     if step == "edit_name":
         if not text:
-            await update.message.reply_text("Please send a valid name.")
+            await message.reply_text("Please send a valid name.")
             return
         users_collection.update_one({"user_id": user_id}, {"$set": {"name": text, "step": "done"}})
-        await update.message.reply_text("✅ Name updated.")
+        await message.reply_text("✅ Name updated.")
         await show_main_menu(update, context)
         return
 
     if step == "edit_department":
         if not text:
-            await update.message.reply_text("Please enter a valid department.")
+            await message.reply_text("Please enter a valid department.")
             return
         users_collection.update_one({"user_id": user_id}, {"$set": {"department": text, "step": "done"}})
-        await update.message.reply_text("✅ Department updated.")
+        await message.reply_text("✅ Department updated.")
         await show_main_menu(update, context)
         return
 
     if step == "edit_year":
         if not text:
-            await update.message.reply_text("Please enter a valid year.")
+            await message.reply_text("Please send a valid year.")
             return
         users_collection.update_one({"user_id": user_id}, {"$set": {"year": text, "step": "done"}})
-        await update.message.reply_text("✅ Year updated.")
+        await message.reply_text("✅ Year updated.")
         await show_main_menu(update, context)
         return
 
     if step == "edit_age":
         if not text.isdigit() or not (16 <= int(text) <= 100):
-            await update.message.reply_text("Please enter a valid age (16–100).")
+            await message.reply_text("Please enter a valid age (16-100).")
             return
         users_collection.update_one({"user_id": user_id}, {"$set": {"age": int(text), "step": "done"}})
-        await update.message.reply_text("✅ Age updated.")
+        await message.reply_text("✅ Age updated.")
         await show_main_menu(update, context)
         return
 
     if step == "edit_bio":
         if not text:
-            await update.message.reply_text("Please send a bio text.")
+            await message.reply_text("Please send a bio text.")
             return
         users_collection.update_one({"user_id": user_id}, {"$set": {"bio": text, "step": "done"}})
-        await update.message.reply_text("✅ Bio updated.")
+        await message.reply_text("✅ Bio updated.")
         await show_main_menu(update, context)
         return
 
@@ -289,7 +456,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         keyboard = [
             [InlineKeyboardButton("Male", callback_data="interest_male"),
-             InlineKeyboardButton("Female", callback_data="interest_female")]
+             InlineKeyboardButton("Female", callback_data="interest_female"),
+             InlineKeyboardButton("Both", callback_data="interest_both")]
         ]
         await update.message.reply_text("Step 7: Discovery Prefs 🔍\n[▓▓▓▓▓▓▓░░░] 70%\n\n*📸 Photo saved! Who would you like to discover on campus?*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return
@@ -310,8 +478,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ------------------- CALLBACK HANDLER -------------------
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    user_id = query.from_user.id  # <-- Add this
-    user = ensure_user_doc(users_collection.find_one({"user_id": user_id}))  # <-- Add this
+    user_id = query.from_user.id
+    # persist username on any callback
+    upsert_tg_username(user_id, query.from_user.username)
+
+    user = ensure_user_doc(users_collection.find_one({"user_id": user_id}))
     chat_id = query.message.chat_id
     data = query.data
     await query.answer()
@@ -353,7 +524,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("edit_"):
         users_collection.update_one({"user_id": user_id}, {"$set": {"step": data}})
-        await safe_edit_or_send_callback(query, f"✏️ Send your new {data.split('_')[1]}:")
+        await safe_edit_or_send_callback(query, f"✏️ Send your new {data.split('_', 1)[1]}:")
         return
 
     if data.startswith("gender_"):
@@ -391,18 +562,170 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "broadcast":
-        # Only allow broadcast from channel
+        # Allow broadcast both from the configured admin channel or private admin
         if chat_id == ADMIN_CHANNEL_ID:
             context.chat_data["awaiting_broadcast"] = True
-            await safe_edit_or_send_callback(query, "Send the message to broadcast (text only):")
+            await safe_edit_or_send_callback(query, "Send the message to broadcast (text only) in this channel.")
+        elif user_id in ADMIN_IDS:
+            context.user_data["awaiting_broadcast"] = True
+            await safe_edit_or_send_callback(query, "Send the message to broadcast (text only) in your private chat. It will be forwarded to all users.")
         else:
-            await safe_edit_or_send_callback(query, "⛔ Only the control channel can broadcast.")
+            await safe_edit_or_send_callback(query, "⛔ Only the control channel or admins can broadcast.")
         return
 
     if data.startswith("report_"):
-        target_id = int(data.split("_", 1)[1])
-        # You can log this or notify admin
-        await safe_edit_or_send_callback(query, "🚫 User reported. Thank you for keeping UniMatch safe!")
+        # Enhanced report handling:
+        try:
+            target_id = int(data.split("_", 1)[1])
+        except Exception:
+            await safe_edit_or_send_callback(query, "Invalid report target.")
+            return
+
+        reporter_id = query.from_user.id
+
+        # Prevent reporter from reporting themselves
+        if reporter_id == target_id:
+            await safe_edit_or_send_callback(query, "You cannot report yourself.")
+            return
+
+        # Prevent duplicate reports by same reporter for the same target (only if open)
+        existing = reports_collection.find_one({
+            "target_id": target_id,
+            "reporter_id": reporter_id,
+            "status": {"$in": ["open", "pending"]}
+        })
+        if existing:
+            await safe_edit_or_send_callback(query, "You've already reported this user. Our admins will review it.")
+            return
+
+        # Persist the report
+        report_doc = {
+            "target_id": target_id,
+            "reporter_id": reporter_id,
+            "created_at": datetime.utcnow(),
+            "status": "open"
+        }
+        try:
+            res = reports_collection.insert_one(report_doc)
+            report_id = str(res.inserted_id)
+        except Exception:
+            logger.exception("Failed to save report to DB for target=%s by reporter=%s", target_id, reporter_id)
+            await safe_edit_or_send_callback(query, "❌ Failed to file the report. Please try again later.")
+            return
+
+        # Acknowledge the reporter
+        await safe_edit_or_send_callback(query, "🚫 Thank you — we've recorded your report. Our admins will review it shortly.")
+
+        # Notify admin channel (or each admin privately if no channel configured)
+        try:
+            target_user = users_collection.find_one({"user_id": target_id}) or {}
+            reporter_user = users_collection.find_one({"user_id": reporter_id}) or {}
+
+            admin_text = (
+                f"⚠️ New report (id: {report_id})\n\n"
+                f"Target: {target_user.get('name','Unknown')} (id: {target_id})\n"
+                f"Reported by: {reporter_user.get('name','Unknown')} (id: {reporter_id})\n"
+                f"Time: {datetime.utcnow().isoformat()} UTC\n\n"
+                f"Use the buttons to view profile / ban or ignore the report."
+            )
+
+            admin_keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("View Profile", callback_data=f"admin_view_{target_id}"),
+                    InlineKeyboardButton("Ban User", callback_data=f"admin_ban_{target_id}")
+                ],
+                [
+                    InlineKeyboardButton("Ignore Report", callback_data=f"admin_ignore_{report_id}")
+                ]
+            ])
+
+            if ADMIN_CHANNEL_ID:
+                await context.bot.send_message(chat_id=ADMIN_CHANNEL_ID, text=admin_text, reply_markup=admin_keyboard)
+            else:
+                # fallback: DM each admin
+                for aid in ADMIN_IDS:
+                    try:
+                        await context.bot.send_message(chat_id=aid, text=admin_text, reply_markup=admin_keyboard)
+                    except Exception:
+                        logger.exception("Failed to DM admin %s about report %s", aid, report_id)
+        except Exception:
+            logger.exception("Failed to notify admins about report %s", report_id)
+
+        return
+
+    if data.startswith("admin_view_"):
+        # Only admins may use admin actions
+        if query.from_user.id not in ADMIN_IDS:
+            await safe_edit_or_send_callback(query, "⛔ Only admins can use this.")
+            return
+        try:
+            target_id = int(data.split("_", 2)[2])
+        except Exception:
+            await safe_edit_or_send_callback(query, "Invalid target.")
+            return
+
+        target = users_collection.find_one({"user_id": target_id})
+        if not target:
+            await safe_edit_or_send_callback(query, "User not found.")
+            return
+
+        photos = target.get("photos", [])
+        caption = (
+            f"{target.get('name','Unknown')}, {target.get('age','N/A')}\n"
+            f"Dept: {target.get('department','N/A')} | Year: {target.get('year','N/A')}\n"
+            f"{target.get('bio','No bio available')}\n"
+            f"ID: {target_id}\n"
+            f"Reported by: see reports collection"
+        )
+
+        admin_actions = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Ban User", callback_data=f"admin_ban_{target_id}"),
+                InlineKeyboardButton("Back to Admin Panel", callback_data="admin_panel")
+            ]
+        ])
+        try:
+            if photos:
+                await query.message.reply_photo(photo=photos[-1], caption=caption, reply_markup=admin_actions)
+            else:
+                await query.message.reply_text(caption, reply_markup=admin_actions)
+        except Exception:
+            logger.exception("Failed to send admin view profile for %s", target_id)
+        return
+
+    if data.startswith("admin_ban_"):
+        if query.from_user.id not in ADMIN_IDS:
+            await safe_edit_or_send_callback(query, "⛔ Only admins can perform this action.")
+            return
+        try:
+            target_id = int(data.split("_", 2)[2])
+        except Exception:
+            await safe_edit_or_send_callback(query, "Invalid target.")
+            return
+        users_collection.update_one({"user_id": target_id}, {"$set": {"banned": True}})
+        await safe_edit_or_send_callback(query, f"User {target_id} has been banned.")
+        try:
+            await context.bot.send_message(target_id, "You have been banned from AAU-LinkUp by the admins.")
+        except Exception:
+            logger.debug("Couldn't DM user about ban (they may not have started the bot).")
+        return
+
+    if data.startswith("admin_ignore_"):
+        if query.from_user.id not in ADMIN_IDS:
+            await safe_edit_or_send_callback(query, "⛔ Only admins can perform this action.")
+            return
+        try:
+            report_id = data.split("_", 2)[2]
+            oid = ObjectId(report_id)
+        except Exception:
+            await safe_edit_or_send_callback(query, "Invalid report id.")
+            return
+        try:
+            reports_collection.update_one({"_id": oid}, {"$set": {"status": "ignored", "reviewed_by": query.from_user.id, "reviewed_at": datetime.utcnow()}})
+            await safe_edit_or_send_callback(query, f"Report {report_id} marked as ignored.")
+        except Exception:
+            logger.exception("Failed to mark report %s as ignored", report_id)
+            await safe_edit_or_send_callback(query, "Failed to mark report as ignored.")
         return
 
     if data == "choice_verify_email":
@@ -420,25 +743,30 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ------------------- PROFILE DISPLAY -------------------
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # This function can be called by callback_query or by a normal message
     user_id = update.callback_query.from_user.id if update.callback_query else update.effective_user.id
+    # persist username
+    if update.callback_query:
+        upsert_tg_username(user_id, update.callback_query.from_user.username)
+    else:
+        upsert_tg_username(user_id, update.effective_user.username)
+
     user = users_collection.find_one({"user_id": user_id})
     if not user:
-        await safe_edit_or_send_callback(update.callback_query, "No profile found.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🌟 Main Menu", callback_data="main_menu")]]))
+        await safe_edit_or_send_message(update, "No profile found.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🌟 Main Menu", callback_data="main_menu")]]))
         return
 
     user = ensure_user_doc(user)
     verified_badge = "🛡 [Verified]" if user.get("is_verified") else "⚪ [Unverified]"
     text = (
-        f"┏━━━━━━━ 💎 IDENTITY ━━━━━━━┓\n"
-        f"┃ {verified_badge}\n"
-        f"┃ 👤 *Name:* {user.get('name')}\n"
-        f"┃ 🎓 *Dept:* {user.get('department')}\n"
-        f"┃ 📅 *Year:* {user.get('year')}\n"
-        f"┃ 🎂 *Age:* {user.get('age')}\n"
-        f"┃ 📝 *Bio:* _\"{user.get('bio')}\"_\n"
-        f"┃ 💬 *Campus Vibe:* {user.get('icebreaker')}\n"
-        f"┃ 🤝 *Network Score:* {len(user.get('liked_by', []))}\n"
-        f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
+        f"👤 *{user.get('name')}*\n"
+        f"Gender: {user.get('gender')}\n"
+        f"Age: {user.get('age')}\n"
+        f"Department: {user.get('department')}\n"
+        f"Year: {user.get('year')}\n"
+        f"Bio: {user.get('bio')}\n"
+        f"❤️ Likes received: {len(user.get('liked_by', []))}\n"
+
     )
     keyboard = [
         [InlineKeyboardButton("✏️ Update My Info", callback_data="edit_profile")],
@@ -467,29 +795,30 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ------------------- MAIN MENU -------------------
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("🔍 Discover Peers", callback_data="find_match")],
-        [InlineKeyboardButton("👤 My Identity", callback_data="view_profile")],
-        [InlineKeyboardButton("✏️ Update Info", callback_data="edit_profile")],
-        [InlineKeyboardButton("🏆 Most Social", callback_data="leaderboard")],
+        [InlineKeyboardButton("💖 Find Match", callback_data="find_match")],
+        [InlineKeyboardButton("👤 View Profile", callback_data="view_profile")],
+        [InlineKeyboardButton("✏️ Edit Profile", callback_data="edit_profile")],
+        [InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard")],
         [InlineKeyboardButton("❓ Help", callback_data="help_command")],  # Added help button
     ]
     if update.effective_user.id in ADMIN_IDS:
         keyboard.append([InlineKeyboardButton("🛠 Admin Control", callback_data="admin_panel")])
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    if update.message:
-        await update.message.reply_text("Choose an option:", reply_markup=reply_markup)
-    else:
-        await safe_edit_or_send_callback(update.callback_query, "Choose an option:", reply_markup=reply_markup)
+    await safe_edit_or_send_message(update, "Choose an option:", reply_markup=reply_markup)
 
 # ------------------- MATCH SYSTEM -------------------
+# ------------------- FIND MATCH -------------------
 async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
+    # persist username on match actions
+    upsert_tg_username(user_id, query.from_user.username)
+
     user = ensure_user_doc(users_collection.find_one({"user_id": user_id}))
 
-    search_query = {"user_id": {"$ne": user_id}, "step": "done"}
+    search_query = {"user_id": {"$ne": user_id}, "step": "done", "banned": {"$ne": True}}
     interested_in = user.get("interested_in")
     if interested_in and interested_in != "both":
         search_query["gender"] = interested_in
@@ -502,14 +831,17 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = c.get("user_id")
         if uid == user_id or uid in (user.get("likes") or []) or uid in (user.get("passed") or []):
             return False
+        # Also skip banned users (defense-in-depth)
+        if c.get("banned"):
+            return False
         return True
 
     filtered = [c for c in candidates if eligible(c)]
-    keyboard = [
-        [InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")]
-    ]
+
+    # If no profiles left to show, reset passed and likes
+        # If no profiles left to show, reset only 'passed' (keep 'likes'!)
     if not filtered:
-        await safe_edit_or_send_callback(query, "No new peers to discover right now 😢 Check back soon!", reply_markup=InlineKeyboardMarkup(keyboard))
+        await safe_edit_or_send_callback(query, "No matches found 😢 Try again later.", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     candidate = random.choice(filtered)
@@ -524,57 +856,78 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"┃ 💬 *Vibe:* {candidate.get('icebreaker')}\n"
         f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
     )
+
     photos = candidate.get("photos", [])
     match_keyboard = [
-        [InlineKeyboardButton("🤝 Connect", callback_data=f"like_{candidate.get('user_id')}"),
-         InlineKeyboardButton("⏭️ Pass", callback_data=f"skip_{candidate.get('user_id')}")],
+        [InlineKeyboardButton("❤️ Like", callback_data=f"like_{candidate.get('user_id')}"),
+         InlineKeyboardButton("💔 Skip", callback_data=f"skip_{candidate.get('user_id')}")],
         [InlineKeyboardButton("🚫 Report", callback_data=f"report_{candidate.get('user_id')}")],
         [InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")]
     ]
-    if photos:
-        await query.message.reply_photo(photos[-1], caption=caption, reply_markup=InlineKeyboardMarkup(match_keyboard))
-    else:
-        await safe_edit_or_send_callback(query, caption, reply_markup=InlineKeyboardMarkup(match_keyboard))
 
+    if photos:
+        await query.message.reply_photo(
+            photos[-1],
+            caption=caption,
+            reply_markup=InlineKeyboardMarkup(match_keyboard)
+        )
+    else:
+        await safe_edit_or_send_callback(
+            query,
+            caption,
+            reply_markup=InlineKeyboardMarkup(match_keyboard)
+        )
+
+# ------------------- LIKE HANDLER -------------------
+# ------------------- LIKE HANDLER -------------------
 # ------------------- LIKE HANDLER -------------------
 async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query:
         await query.answer()
+    else:
+        return
+
     user_id = query.from_user.id
+    # persist username of the user pressing like
+    upsert_tg_username(user_id, query.from_user.username)
+
     if not query.data or "_" not in query.data:
         await query.answer("Invalid action")
         return
+
     try:
         liked_id = int(query.data.split("_", 1)[1])
     except Exception:
         await query.answer("Invalid target.")
         return
 
+    if liked_id == user_id:
+        await query.answer("You can't like yourself.")
+        return
+
+    # Load both users
     liker = ensure_user_doc(users_collection.find_one({"user_id": user_id}))
     liked = ensure_user_doc(users_collection.find_one({"user_id": liked_id}))
-
     if not liked.get("user_id"):
         await query.answer("User not found.")
         return
 
+    # Prevent duplicate likes
+    if liked_id in (liker.get("likes") or []):
+        await query.answer("You've already connected with this user.")
+        await find_match(update, context)
+        return
+
+    # Update likes and liked_by
     users_collection.update_one({"user_id": user_id}, {"$addToSet": {"likes": liked_id}})
     users_collection.update_one({"user_id": liked_id}, {"$addToSet": {"liked_by": user_id}})
 
-    # Secret Hint Notification
-    try:
-        liker_dept = liker.get("department", "Unknown")
-        liker_year = liker.get("year", "Unknown")
-        await context.bot.send_message(
-            liked_id, 
-            f"🔍 *Discovery Hint:* Someone from {liker_dept} ({liker_year}) just tried to connect with you! ⚡️\nCheck your stack to find them!",
-            parse_mode="Markdown"
-        )
-    except Exception:
-        pass
-
     liked_doc = users_collection.find_one({"user_id": liked_id})
     liked_name = liked_doc.get("name", "Someone")
+    liked_likes = liked_doc.get("likes", [])
+    mutual = user_id in liked_likes
+
     await query.answer(f"You liked {liked_name} ❤️")
 
     if user_id in liked_doc.get("likes", []):
@@ -585,15 +938,88 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             mention_for_liker = f"@{liked_tg}" if liked_tg else liked_name
             mention_for_liked = f"@{liker_tg}" if liker_tg else liker_name
-            await context.bot.send_message(user_id, f"⚡️ New Connection! You and {liked_name} wanted to connect!\nReach out: {mention_for_liker}")
+            await context.bot.send_message(user_id, f"💞 It's a match! You and {liked_name} liked each other!\nContact: {mention_for_liker}")
         except Exception:
             pass
         try:
-            await context.bot.send_message(liked_id, f"⚡️ New Connection! You and {liker_name} wanted to connect!\nReach out: {mention_for_liked}")
+            await context.bot.send_message(liked_id, f"💞 It's a match! You and {liker_name} liked each other!\nContact: {mention_for_liked}")
         except Exception:
-            pass
+            logger.exception("Failed to deliver next notification after mutual like for %s", liked_id)
+        return
 
+    # If not mutual, queue and maybe notify (rate-limited)
+    try:
+        await handle_new_like_notification(user_id, liked_id, context)
+    except Exception:
+        logger.exception("Failed to handle new like notification for %s -> %s", user_id, liked_id)
+
+    # Move to next match
     await find_match(update, context)
+
+
+
+
+async def show_liker_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    # persist username on this callback too
+    upsert_tg_username(query.from_user.id, query.from_user.username)
+
+    try:
+        liker_id = int(data.split("_", 2)[2])
+    except Exception:
+        await query.answer("Invalid user.")
+        return
+
+    liker = users_collection.find_one({"user_id": liker_id})
+    if not liker:
+        await query.answer("User not found.")
+        return
+
+    photos = liker.get("photos", [])
+    caption = (
+        f"{liker.get('name', 'Unknown')}, {liker.get('age', 'N/A')}\n"
+        f"Department: {liker.get('department', 'N/A')}\n"
+        f"Year: {liker.get('year', 'N/A')}\n"
+        f"{liker.get('bio', 'No bio available')}"
+    )
+
+    match_keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("👍 Connect", callback_data=f"like_{liker_id}"),
+            InlineKeyboardButton("⏭ Skip", callback_data=f"skip_{liker_id}")
+        ],
+        [
+            InlineKeyboardButton("🚫 Report", callback_data=f"report_{liker_id}")
+        ],
+        [
+            InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")
+        ]
+    ])
+
+    # Mark the corresponding sent notification as responded (they viewed)
+    try:
+        await mark_notifications_responded(query.from_user.id, liker_id=liker_id, response_type="viewed")
+        # After responding, if there are queued notifications, try to deliver the latest immediately
+        await try_deliver_next_notification(query.from_user.id, context)
+    except Exception:
+        logger.exception("Error marking/delivering notifications after show_liker_profile for %s", query.from_user.id)
+
+    if photos:
+        await query.message.reply_photo(
+            photo=photos[-1],
+            caption=caption,
+            parse_mode="Markdown",
+            reply_markup=match_keyboard
+        )
+    else:
+        await query.message.reply_text(
+            caption,
+            parse_mode="Markdown",
+            reply_markup=match_keyboard
+        )
 
 # ------------------- LEADERBOARD -------------------
 async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -623,27 +1049,23 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    if update.callback_query:
-        await safe_edit_or_send_callback(update.callback_query, msg, parse_mode="Markdown", reply_markup=reply_markup)
-    else:
-        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=reply_markup)
+    await safe_edit_or_send_message(update, msg, parse_mode="Markdown", reply_markup=reply_markup)
 
 # ------------------- ADMIN PANEL -------------------
 async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Only allow for users in ADMIN_IDS
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
-        await safe_edit_or_send_callback(update.callback_query, "⛔ Admin panel only available to bot admins.")
+        await safe_edit_or_send_message(update, "⛔ Admin panel only available to bot admins.")
         return
     keyboard = [
         [InlineKeyboardButton("📊 View Leaderboard", callback_data="leaderboard")],
         [InlineKeyboardButton("📢 Broadcast Message", callback_data="broadcast")],
+        [InlineKeyboardButton("❗ View Open Reports", callback_data="admin_list_reports")]
     ]
-    await safe_edit_or_send_callback(update.callback_query, "🛠 Admin Panel:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await safe_edit_or_send_message(update, "🛠 Admin Panel:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 # ------------------- ADMIN COMMAND -------------------
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Only allow /admin for users in ADMIN_IDS
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Admin panel only available to bot admins.")
@@ -654,44 +1076,65 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "👋 *Welcome to UniMatch!*\n\n"
-        "Connect with peers, find study buddies, or share interests at your university.\n"
-        "Use /start to begin, or the menu to explore discovery features.\n"
+        "Find friends, dates, or study buddies at your university.\n"
+        "Use /start to begin, or the menu to explore features.\n"
         "If you need help, contact @Urcoder21."
     )
-    if hasattr(update, "message") and update.message:
-        await update.message.reply_text(help_text, parse_mode="Markdown")
-    elif hasattr(update, "callback_query") and update.callback_query:
-        await update.callback_query.message.reply_text(help_text, parse_mode="Markdown")
-    else:
-        # Fallback: do nothing or log
-        pass
+    await safe_edit_or_send_message(update, help_text, parse_mode="Markdown")
 
 
-# Add handler for help button in callback handler
-async def handle_help_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await help_command(update, context)
-
+# ------------------- IGNORE LIKE HANDLER -------------------
+async def ignore_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Simple acknowledgement for the 'skip' button on like notification
+    if update.callback_query:
+        await update.callback_query.answer("Skipped ❤️")
+        # mark sent notifications as responded/ignored
+        try:
+            await mark_notifications_responded(update.callback_query.from_user.id, response_type="ignored")
+            # After ignoring, attempt to deliver next queued notification immediately
+            await try_deliver_next_notification(update.callback_query.from_user.id, context)
+        except Exception:
+            logger.exception("Failed to mark/deliver notifications after ignore_like for %s", update.callback_query.from_user.id)
 
 # ------------------- APP SETUP -------------------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
+
+    # --- Command Handlers ---
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(CallbackQueryHandler(handle_like, pattern=r"^like_"))
-    app.add_handler(CallbackQueryHandler(handle_buttons))
     app.add_handler(CommandHandler("admin", admin_command))
 
-    # Set webhook with Telegram
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        webhook_url=f"{BASE_URL}{WEBHOOK_PATH}",
-        webhook_path=WEBHOOK_PATH,
-    )
+    # --- Message Handlers ---
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+
+    # --- Callback Query Handlers (specific ones first) ---
+    # It's important that specific callback patterns are added before the generic handler below.
+    app.add_handler(CallbackQueryHandler(show_liker_profile, pattern=r"^show_liker_"))
+    app.add_handler(CallbackQueryHandler(handle_like, pattern=r"^like_"))
+    app.add_handler(CallbackQueryHandler(ignore_like, pattern="ignore_like"))
+
+    # Admin action handlers
+    app.add_handler(CallbackQueryHandler(lambda u, c: None, pattern=r"^admin_list_reports$"))  # placeholder if you want to implement listing
+    app.add_handler(CallbackQueryHandler(handle_buttons, pattern=r"^admin_view_"))  # route to handle_buttons for admin_view_
+    app.add_handler(CallbackQueryHandler(handle_buttons, pattern=r"^admin_ban_"))  # route to handle_buttons for admin_ban_
+    app.add_handler(CallbackQueryHandler(handle_buttons, pattern=r"^admin_ignore_"))  # route to handle_buttons for admin_ignore_
+
+    # --- Keep this last! (generic handler) ---
+    app.add_handler(CallbackQueryHandler(handle_buttons))
+
+    # Use webhook if BASE_URL is provided, otherwise fallback to polling (convenient for local dev)
+    if BASE_URL:
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=BOT_TOKEN,  # Use token as the URL path
+            webhook_url=f"{BASE_URL}/{BOT_TOKEN}",
+        )
+    else:
+        logger.info("BASE_URL not set; starting polling mode.")
+        app.run_polling()
 
 if __name__ == "__main__":
     main()
