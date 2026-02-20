@@ -23,6 +23,7 @@ PORT = int(os.getenv("PORT", 10000))
 BASE_URL = os.getenv("BASE_URL")  # e.g. https://your-app-name.onrender.com
 
 
+
 client = MongoClient(MONGO_URI)
 db = client["unimatch_bot"]
 users_collection = db["users"]
@@ -45,6 +46,7 @@ async def safe_edit_or_send_message(update, text, reply_markup=None, parse_mode=
         await update.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
 
 
+
 def ensure_user_doc(doc):
     defaults = {
         "user_id": None,
@@ -61,6 +63,10 @@ def ensure_user_doc(doc):
         "liked_by": [],
         "passed": [],
         "step": "awaiting_name",
+        "is_verified": False,
+        "email": None,
+        "verification_otp": None,
+        "icebreaker": "",
     }
     if doc is None:
         return defaults.copy()
@@ -95,8 +101,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "year": ""
     })
     await update.message.reply_text(
-        "Hey 👋 Welcome to UniMatch!\nPress the button to start onboarding:",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Start", callback_data="start_onboarding")]])
+        "Hey 👋 Welcome to UniMatch!\nPress the button to start your campus journey:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Join Registry", callback_data="start_onboarding")]])
     )
 
 # ------------------- ONBOARDING -------------------
@@ -106,7 +112,7 @@ async def start_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     tg_username = query.from_user.username
     users_collection.update_one({"user_id": user_id}, {"$set": {"step": "awaiting_name", "tg_username": tg_username}})
-    await safe_edit_or_send_callback(query, "First, your name?:", parse_mode="Markdown")
+    await safe_edit_or_send_callback(query, "Step 1: Your Identity 👤\n[▓░░░░░░░░░] 10%\n\n*What is your full name?*", parse_mode="Markdown")
 
 # ------------------- MESSAGE HANDLER -------------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -147,7 +153,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("Please send a valid name.")
             return
         users_collection.update_one({"user_id": user_id}, {"$set": {"name": text, "step": "awaiting_department"}})
-        await message.reply_text("Great! Now enter your department (e.g., Computer Science):")
+        await message.reply_text("Step 2: Department 🎓\n[▓▓░░░░░░░░] 20%\n\n*Great! Now enter your department (e.g., Computer Science):*", parse_mode="Markdown")
         return
 
     if step == "awaiting_department":
@@ -155,7 +161,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("Please enter a valid department.")
             return
         users_collection.update_one({"user_id": user_id}, {"$set": {"department": text, "step": "awaiting_year"}})
-        await message.reply_text("Awesome! Now enter your year (e.g., 1st, 2nd, 3rd, 4th, Alumni):")
+        await message.reply_text("Step 3: Year 📅\n[▓▓▓░░░░░░░] 30%\n\n*Awesome! Now enter your year (e.g., 1st, 2nd, 3rd, 4th, Alumni):*", parse_mode="Markdown")
         return
 
     if step == "awaiting_year":
@@ -167,7 +173,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("Male", callback_data="gender_male"),
              InlineKeyboardButton("Female", callback_data="gender_female")]
         ]
-        await message.reply_text("Nice! Now select your gender:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await message.reply_text("Step 4: Your Gender 👤\n[▓▓▓▓░░░░░░] 40%\n\n*Select your gender below:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return
 
     if step == "awaiting_age":
@@ -175,16 +181,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Please enter a valid age (16–100).")
             return
         users_collection.update_one({"user_id": user_id}, {"$set": {"age": int(text), "step": "awaiting_photo"}})
-        await update.message.reply_text("Cool 😎 Now upload a profile photo.")
+        await update.message.reply_text("Step 6: Appearance 📸\n[▓▓▓▓▓▓░░░░] 60%\n\n*Cool 😎 Now upload a high-quality profile photo:*", parse_mode="Markdown")
         return
 
     if step == "awaiting_bio":
         if not text:
             await update.message.reply_text("Please write a short bio about yourself.")
             return
-        users_collection.update_one({"user_id": user_id}, {"$set": {"bio": text, "step": "done"}})
-        await update.message.reply_text("Profile complete! 🎉")
-        await show_main_menu(update, context)
+        users_collection.update_one({"user_id": user_id}, {"$set": {"bio": text, "step": "awaiting_icebreaker"}})
+        await message.reply_text(
+            "Step 9: Campus Vibe 💬\n[▓▓▓▓▓▓▓▓░░] 85%\n\n*Almost there! Choose one and answer:* \n1. Best gate to meet at?\n2. 6K vs 5K library?\n3. Hidden study spot?\n\n(Just reply with your answer)",
+            parse_mode="Markdown"
+        )
+        return
+
+    if step == "awaiting_icebreaker":
+        if not text:
+            await update.message.reply_text("Please provide an answer.")
+            return
+        users_collection.update_one({"user_id": user_id}, {"$set": {"icebreaker": text, "step": "awaiting_email_choice"}})
+        keyboard = [
+            [InlineKeyboardButton("📧 Verify Campus Email", callback_data="choice_verify_email")],
+            [InlineKeyboardButton("⏭️ Skip & Finish", callback_data="choice_skip_email")]
+        ]
+        await update.message.reply_text(
+            "Step 10: Verification 🛡\n[▓▓▓▓▓▓▓▓▓░] 95%\n\n*Final step! Would you like to verify your campus email (e.g., name-ug@aau.edu.et) to get the Verified Badge?*",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
         return
 
     if step == "edit_name":
@@ -232,6 +256,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_main_menu(update, context)
         return
 
+    if step == "awaiting_email_input":
+        if not text.endswith("@aau.edu.et"):
+            await update.message.reply_text("❌ Please enter a valid AAU email (e.g., firstname.lastname-ug@aau.edu.et).")
+            return
+        
+        # Automatic verification — valid AAU email format = instantly verified
+        users_collection.update_one({"user_id": user_id}, {"$set": {"email": text, "is_verified": True, "step": "done"}})
+        await update.message.reply_text("🎉 *Verification successful!* You now have the *Verified 🛡* badge.\n\nWelcome to the verified community!", parse_mode="Markdown")
+        await show_main_menu(update, context)
+        return
+
     await update.message.reply_text(
         "I didn't understand that. Use the menu.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🌟 Main Menu", callback_data="main_menu")]])
@@ -256,7 +291,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("Male", callback_data="interest_male"),
              InlineKeyboardButton("Female", callback_data="interest_female")]
         ]
-        await update.message.reply_text("📸 Photo saved! Great! Who are you interested in?", reply_markup=InlineKeyboardMarkup(keyboard))
+        await update.message.reply_text("Step 7: Discovery Prefs 🔍\n[▓▓▓▓▓▓▓░░░] 70%\n\n*📸 Photo saved! Who would you like to discover on campus?*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return
 
     if step == "edit_photo":
@@ -330,13 +365,13 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_main_menu(update, context)
         else:
             users_collection.update_one({"user_id": user_id}, {"$set": {"gender": gender, "step": "awaiting_age"}})
-            await safe_edit_or_send_callback(query, "Enter your age (16–100):")
+            await safe_edit_or_send_callback(query, "Step 5: Age 🎂\n[▓▓▓▓▓░░░░░] 50%\n\n*How old are you? (16–100):*", parse_mode="Markdown")
         return
 
     if data.startswith("interest_"):
         interest = data.split("_", 1)[1]
         users_collection.update_one({"user_id": user_id}, {"$set": {"interested_in": interest, "step": "awaiting_bio"}})
-        await safe_edit_or_send_callback(query, "Great! Write a short bio about yourself:")
+        await safe_edit_or_send_callback(query, "Step 8: About You 📝\n[▓▓▓▓▓▓▓▓░░] 80%\n\n*Great! Write a short bio about yourself (your vibes, goals, or hobbies):*", parse_mode="Markdown")
         return
 
     if data == "view_profile":
@@ -370,8 +405,15 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_or_send_callback(query, "🚫 User reported. Thank you for keeping UniMatch safe!")
         return
 
-    if data == "help_command":
-        await help_command(update, context)
+    if data == "choice_verify_email":
+        users_collection.update_one({"user_id": user_id}, {"$set": {"step": "awaiting_email_input"}})
+        await safe_edit_or_send_callback(query, "Please enter your university email (e.g., firstname.lastname-ug@aau.edu.et):")
+        return
+
+    if data == "choice_skip_email":
+        users_collection.update_one({"user_id": user_id}, {"$set": {"step": "done"}})
+        await safe_edit_or_send_callback(query, "Profile complete! 🎉 Hope you connect with some amazing peers!")
+        await show_main_menu(update, context)
         return
 
     await safe_edit_or_send_callback(query, "Unknown action. Use the menu.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🌟 Main Menu", callback_data="main_menu")]]))
@@ -385,18 +427,21 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user = ensure_user_doc(user)
+    verified_badge = "🛡 [Verified]" if user.get("is_verified") else "⚪ [Unverified]"
     text = (
-        f"👤 *{user.get('name')}*\n"
-        f"Gender: {user.get('gender')}\n"
-        f"Age: {user.get('age')}\n"
-        f"Department: {user.get('department')}\n"
-        f"Year: {user.get('year')}\n"
-        f"Bio: {user.get('bio')}\n"
-        f"❤️ Likes received: {len(user.get('liked_by', []))}\n"
-
+        f"┏━━━━━━━ 💎 IDENTITY ━━━━━━━┓\n"
+        f"┃ {verified_badge}\n"
+        f"┃ 👤 *Name:* {user.get('name')}\n"
+        f"┃ 🎓 *Dept:* {user.get('department')}\n"
+        f"┃ 📅 *Year:* {user.get('year')}\n"
+        f"┃ 🎂 *Age:* {user.get('age')}\n"
+        f"┃ 📝 *Bio:* _\"{user.get('bio')}\"_\n"
+        f"┃ 💬 *Campus Vibe:* {user.get('icebreaker')}\n"
+        f"┃ 🤝 *Network Score:* {len(user.get('liked_by', []))}\n"
+        f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
     )
     keyboard = [
-        [InlineKeyboardButton("✏️ Edit Profile", callback_data="edit_profile")],
+        [InlineKeyboardButton("✏️ Update My Info", callback_data="edit_profile")],
         [InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -422,14 +467,14 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ------------------- MAIN MENU -------------------
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("💖 Find Match", callback_data="find_match")],
-        [InlineKeyboardButton("👤 View Profile", callback_data="view_profile")],
-        [InlineKeyboardButton("✏️ Edit Profile", callback_data="edit_profile")],
-        [InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard")],
+        [InlineKeyboardButton("🔍 Discover Peers", callback_data="find_match")],
+        [InlineKeyboardButton("👤 My Identity", callback_data="view_profile")],
+        [InlineKeyboardButton("✏️ Update Info", callback_data="edit_profile")],
+        [InlineKeyboardButton("🏆 Most Social", callback_data="leaderboard")],
         [InlineKeyboardButton("❓ Help", callback_data="help_command")],  # Added help button
     ]
     if update.effective_user.id in ADMIN_IDS:
-        keyboard.append([InlineKeyboardButton("🛠 Admin Panel", callback_data="admin_panel")])
+        keyboard.append([InlineKeyboardButton("🛠 Admin Control", callback_data="admin_panel")])
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     if update.message:
@@ -464,20 +509,25 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")]
     ]
     if not filtered:
-        await safe_edit_or_send_callback(query, "No matches found 😢 Try again later.", reply_markup=InlineKeyboardMarkup(keyboard))
+        await safe_edit_or_send_callback(query, "No new peers to discover right now 😢 Check back soon!", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     candidate = random.choice(filtered)
+    v_badge = " 🛡" if candidate.get("is_verified") else ""
     caption = (
-        f"{candidate.get('name')}, {candidate.get('age')}\n"
-        f"Department: {candidate.get('department')}\n"
-        f"Year: {candidate.get('year')}\n"
-        f"{candidate.get('bio')}"
+        f"┏━━━━━━━ 🔎 DISCOVERY ━━━━━━━┓\n"
+        f"┃ 👤 *Name:* {candidate.get('name')}{v_badge}\n"
+        f"┃ 🎓 *Dept:* {candidate.get('department')}\n"
+        f"┃ 📅 *Year:* {candidate.get('year')}\n"
+        f"┃ 🎂 *Age:* {candidate.get('age')}\n"
+        f"┃ 📝 *Bio:* _\"{candidate.get('bio')}\"_\n"
+        f"┃ 💬 *Vibe:* {candidate.get('icebreaker')}\n"
+        f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
     )
     photos = candidate.get("photos", [])
     match_keyboard = [
-        [InlineKeyboardButton("❤️ Like", callback_data=f"like_{candidate.get('user_id')}"),
-         InlineKeyboardButton("💔 Skip", callback_data=f"skip_{candidate.get('user_id')}")],
+        [InlineKeyboardButton("🤝 Connect", callback_data=f"like_{candidate.get('user_id')}"),
+         InlineKeyboardButton("⏭️ Pass", callback_data=f"skip_{candidate.get('user_id')}")],
         [InlineKeyboardButton("🚫 Report", callback_data=f"report_{candidate.get('user_id')}")],
         [InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")]
     ]
@@ -511,6 +561,18 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users_collection.update_one({"user_id": user_id}, {"$addToSet": {"likes": liked_id}})
     users_collection.update_one({"user_id": liked_id}, {"$addToSet": {"liked_by": user_id}})
 
+    # Secret Hint Notification
+    try:
+        liker_dept = liker.get("department", "Unknown")
+        liker_year = liker.get("year", "Unknown")
+        await context.bot.send_message(
+            liked_id, 
+            f"🔍 *Discovery Hint:* Someone from {liker_dept} ({liker_year}) just tried to connect with you! ⚡️\nCheck your stack to find them!",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
     liked_doc = users_collection.find_one({"user_id": liked_id})
     liked_name = liked_doc.get("name", "Someone")
     await query.answer(f"You liked {liked_name} ❤️")
@@ -523,11 +585,11 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             mention_for_liker = f"@{liked_tg}" if liked_tg else liked_name
             mention_for_liked = f"@{liker_tg}" if liker_tg else liker_name
-            await context.bot.send_message(user_id, f"💞 It's a match! You and {liked_name} liked each other!\nContact: {mention_for_liker}")
+            await context.bot.send_message(user_id, f"⚡️ New Connection! You and {liked_name} wanted to connect!\nReach out: {mention_for_liker}")
         except Exception:
             pass
         try:
-            await context.bot.send_message(liked_id, f"💞 It's a match! You and {liker_name} liked each other!\nContact: {mention_for_liked}")
+            await context.bot.send_message(liked_id, f"⚡️ New Connection! You and {liker_name} wanted to connect!\nReach out: {mention_for_liked}")
         except Exception:
             pass
 
@@ -592,8 +654,8 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "👋 *Welcome to UniMatch!*\n\n"
-        "Find friends, dates, or study buddies at your university.\n"
-        "Use /start to begin, or the menu to explore features.\n"
+        "Connect with peers, find study buddies, or share interests at your university.\n"
+        "Use /start to begin, or the menu to explore discovery features.\n"
         "If you need help, contact @Urcoder21."
     )
     if hasattr(update, "message") and update.message:
